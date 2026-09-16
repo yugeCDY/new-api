@@ -1,0 +1,78 @@
+# New-API 生产部署 Compose —— 从本地源码构建镜像（docker-compose.prod.yml）
+#
+# 用法：
+#   1. 在 yaml 同目录创建 .env（已被 .gitignore 排除，不会提交到仓库）：
+#        POSTGRES_PASSWORD=xxx
+#        REDIS_PASSWORD=xxx
+#        SESSION_SECRET=xxx
+#   2. docker compose -f docker-compose.prod.yml up -d --build
+#
+# 说明：
+#   - 密码/密钥通过 ${VAR} 从 .env 读取，不硬编码在 yaml 里
+#   - 密码建议只用字母数字（如上例），若含 @ : / % 等特殊字符需 URL 编码，否则 DSN 解析会出错
+#   - 测试阶段用 IP + HTTP 即可（SESSION_COOKIE_SECURE 保持默认 false）；
+#     上线 HTTPS 后再启用 Secure Cookie 并配置 TRUSTED_URL
+
+services:
+  new-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: new-api:local
+    container_name: new-api
+    restart: always
+    command: --log-dir /app/logs
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./data:/data
+      - ./logs:/app/logs
+    environment:
+      - SQL_DSN=postgresql://root:${POSTGRES_PASSWORD}@postgres:5432/new-api
+      - REDIS_CONN_STRING=redis://:${REDIS_PASSWORD}@redis:6379
+      - SESSION_SECRET=${SESSION_SECRET}
+      - TZ=Asia/Shanghai
+      - NODE_NAME=new-api-node-1
+      - ERROR_LOG_ENABLED=true
+      - BATCH_UPDATE_ENABLED=true
+      # HTTP 测试阶段保持 Secure=false（默认）。上 HTTPS 后取消注释：
+      # - SESSION_COOKIE_SECURE=true
+      # - SESSION_COOKIE_TRUSTED_URL=https://your-domain
+    depends_on:
+      - redis
+      - postgres
+    networks:
+      - new-api-network
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:3000/api/status | grep -o '\"success\":\\s*true' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  redis:
+    image: redis:7-alpine
+    container_name: new-api-redis
+    restart: always
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD}"]
+    networks:
+      - new-api-network
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: new-api-postgres
+    restart: always
+    environment:
+      POSTGRES_USER: root
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: new-api
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    networks:
+      - new-api-network
+
+volumes:
+  pg_data:
+
+networks:
+  new-api-network:
+    driver: bridge

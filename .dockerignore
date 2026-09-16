@@ -9,4 +9,10 @@ docs
 .gocache
 /web/node_modules
 /web/dist
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+new-api.dev.exe
+logs
 !THIRD-PARTY-LICENSES.md
