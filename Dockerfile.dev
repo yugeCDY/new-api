@@ -19,8 +19,11 @@ RUN go mod download
 
 COPY . .
 
-RUN mkdir -p web/dist && \
-    echo '<!doctype html><html><head><title>dev</title></head><body>use frontend dev server</body></html>' > web/dist/index.html
+# Prefer a prebuilt web/dist (e.g. local/CI frontend build). Fall back to placeholder only when absent.
+RUN if [ ! -f web/dist/index.html ]; then \
+      mkdir -p web/dist && \
+      echo '<!doctype html><html><head><title>dev</title></head><body>use frontend dev server</body></html>' > web/dist/index.html; \
+    fi
 
 RUN go build -ldflags "-s -w -X 'github.com/QuantumNous/new-api/common.Version=$(cat VERSION)'" -o new-api
 

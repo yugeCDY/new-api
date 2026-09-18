@@ -635,6 +635,7 @@ func executeTaskSubmissionWith(
 		diagnostics.failed("insert", "database_error", taskErr, false)
 		return nil, taskErr
 	}
+	service.RecordUsageAttribution(c, "task", task.TaskID, task.UserId, task.PrivateData.TokenId)
 	durable = true
 	stage = "settle"
 	diagnostics.durable(task)
@@ -647,6 +648,11 @@ func executeTaskSubmissionWith(
 		return nil, taskErr
 	}
 	service.LogTaskConsumption(c, relayInfo, task)
+	if task.Status == model.TaskStatusSuccess {
+		service.RecordTaskFinalizedUsage(c.Request.Context(), task, &relaycommon.TaskInfo{
+			Status: model.TaskStatusSuccess,
+		})
+	}
 	diagnostics.complete(task, result.Quota)
 
 	return &taskSubmissionOutcome{Result: result, Task: task, RelayInfo: relayInfo}, nil

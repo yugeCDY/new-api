@@ -67,6 +67,16 @@ func invalidateUserCache(userId int) error {
 	return common.RedisDelKey(getUserCacheKey(userId))
 }
 
+// InvalidateUserCache clears the shared user authentication/quota snapshot.
+// Integrations that commit user mutations in their own transaction must call
+// this after commit so a stale cached status cannot authorize later requests.
+func InvalidateUserCache(userId int) error {
+	if userId <= 0 {
+		return errors.New("userId is invalid")
+	}
+	return invalidateUserCache(userId)
+}
+
 func populateUserCache(user User) error {
 	if !common.RedisEnabled {
 		return nil

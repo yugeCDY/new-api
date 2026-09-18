@@ -33,6 +33,9 @@ services:
       - BATCH_UPDATE_ENABLED=true
       # Local HTTP dev mode: keep Secure=false and leave TRUSTED_URL unset. This disables the refresh/logout OriginGuard so the :5173 -> :3000 dev proxy works.
       - SESSION_COOKIE_SECURE=false
+      - NOVA_INTEGRATION_ENABLED=${NOVA_INTEGRATION_ENABLED:-false}
+      - NOVA_HMAC_KEYS=${NOVA_HMAC_KEYS:-}
+      - NOVA_RABBITMQ_URL=${NOVA_RABBITMQ_URL:-amqp://nova_dev:nova_dev_only@rabbitmq:5672/}
       # For HTTPS only: set Secure=true and list every exact trusted HTTPS browser Origin. This does not configure relay CORS.
       # - SESSION_COOKIE_SECURE=true
       # - SESSION_COOKIE_TRUSTED_URL=https://example.com,https://admin.example.com
@@ -69,9 +72,32 @@ services:
       timeout: 3s
       retries: 5
 
+  rabbitmq:
+    image: rabbitmq:4.3.6-management-alpine
+    container_name: new-api-dev-rabbitmq
+    restart: unless-stopped
+    profiles: ["nova"]
+    environment:
+      # Development-only credentials. Never reuse them in production.
+      RABBITMQ_DEFAULT_USER: nova_dev
+      RABBITMQ_DEFAULT_PASS: nova_dev_only
+    volumes:
+      - dev_rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      - dev-network
+    ports:
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
 volumes:
   dev_data:
   dev_pg_data:
+  dev_rabbitmq_data:
 
 networks:
   dev-network:

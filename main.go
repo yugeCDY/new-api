@@ -19,6 +19,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/controller"
 	"github.com/QuantumNous/new-api/i18n"
+	"github.com/QuantumNous/new-api/integration/nova"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
@@ -62,6 +63,7 @@ func main() {
 		common.FatalLog("failed to initialize resources: " + err.Error())
 		return
 	}
+	defer nova.Close()
 
 	common.SysLog("New API " + common.Version + " started")
 	if os.Getenv("GIN_MODE") != "debug" {
@@ -314,6 +316,10 @@ func InitResources() error {
 	err = model.InitDB()
 	if err != nil {
 		common.FatalLog("failed to initialize database: " + err.Error())
+		return err
+	}
+	if err = nova.Initialize(model.DB); err != nil {
+		common.FatalLog("failed to initialize Nova integration: " + err.Error())
 		return err
 	}
 	if err = authz.Init(model.DB); err != nil {

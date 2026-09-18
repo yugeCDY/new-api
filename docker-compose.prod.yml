@@ -35,6 +35,9 @@ services:
       - NODE_NAME=new-api-node-1
       - ERROR_LOG_ENABLED=true
       - BATCH_UPDATE_ENABLED=true
+      - NOVA_INTEGRATION_ENABLED=${NOVA_INTEGRATION_ENABLED:-false}
+      - NOVA_HMAC_KEYS=${NOVA_HMAC_KEYS:-}
+      - NOVA_RABBITMQ_URL=amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
       # HTTP 测试阶段保持 Secure=false（默认）。上 HTTPS 后取消注释：
       # - SESSION_COOKIE_SECURE=true
       # - SESSION_COOKIE_TRUSTED_URL=https://your-domain
@@ -70,8 +73,27 @@ services:
     networks:
       - new-api-network
 
+  rabbitmq:
+    image: rabbitmq:4.3.6-management-alpine
+    container_name: new-api-rabbitmq
+    restart: always
+    profiles: ["nova"]
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      - new-api-network
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
 volumes:
   pg_data:
+  rabbitmq_data:
 
 networks:
   new-api-network:

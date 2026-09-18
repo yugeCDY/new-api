@@ -51,6 +51,9 @@ services:
 #      - GOOGLE_ANALYTICS_ID=G-XXXXXXXXXX  # Google Analytics 的测量 ID (Google Analytics Measurement ID)
 #      - UMAMI_WEBSITE_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx  # Umami 网站 ID (Umami Website ID)
 #      - UMAMI_SCRIPT_URL=https://analytics.umami.is/script.js  # Umami 脚本 URL，默认为官方地址 (Umami Script URL, defaults to official URL)
+#      - NOVA_INTEGRATION_ENABLED=true
+#      - NOVA_HMAC_KEYS=current:BASE64URL_ENCODED_32_BYTE_SECRET
+#      - NOVA_RABBITMQ_URL=amqp://nova:change_me@rabbitmq:5672/
 
     depends_on:
       - redis
@@ -88,6 +91,26 @@ services:
 #    ports:
 #      - "5432:5432"  # Uncomment if you need to access PostgreSQL from outside Docker
 
+  rabbitmq:
+    image: rabbitmq:4.3.6-management-alpine
+    container_name: new-api-rabbitmq
+    restart: always
+    profiles: ["nova"]
+    environment:
+      RABBITMQ_DEFAULT_USER: nova
+      RABBITMQ_DEFAULT_PASS: change_me # ⚠️ IMPORTANT: Change this password before use!
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      - new-api-network
+    ports:
+      - "127.0.0.1:15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
 #  mysql:
 #    image: mysql:8.2
 #    container_name: mysql
@@ -121,6 +144,7 @@ services:
 
 volumes:
   pg_data:
+  rabbitmq_data:
 #  mysql_data:
 #  clickhouse_data:
 
