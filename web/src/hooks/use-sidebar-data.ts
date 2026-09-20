@@ -27,6 +27,7 @@ import {
   LayoutDashboard,
   ListTodo,
   MessageSquare,
+  Microscope,
   PlugZap,
   Radio,
   ServerCog,
@@ -161,6 +162,12 @@ export function useSidebarData(): SidebarData {
             title: t('System Info'),
             url: '/system-info',
             icon: ServerCog,
+            requiredRole: ROLE.SUPER_ADMIN,
+          },
+          {
+            title: t('Nova integration lab'),
+            url: '/nova-test',
+            icon: Microscope,
             requiredRole: ROLE.SUPER_ADMIN,
           },
           {

@@ -36,6 +36,7 @@ services:
       - NOVA_INTEGRATION_ENABLED=${NOVA_INTEGRATION_ENABLED:-false}
       - NOVA_HMAC_KEYS=${NOVA_HMAC_KEYS:-}
       - NOVA_RABBITMQ_URL=${NOVA_RABBITMQ_URL:-amqp://nova_dev:nova_dev_only@rabbitmq:5672/}
+      - CRITICAL_RATE_LIMIT_ENABLE=false
       # For HTTPS only: set Secure=true and list every exact trusted HTTPS browser Origin. This does not configure relay CORS.
       # - SESSION_COOKIE_SECURE=true
       # - SESSION_COOKIE_TRUSTED_URL=https://example.com,https://admin.example.com
