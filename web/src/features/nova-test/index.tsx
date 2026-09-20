@@ -22,6 +22,8 @@ import { ChevronDown, Settings2, Sparkles } from 'lucide-react'
 import { useState } from 'react'
 import { FormProvider, useForm } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
+
+import { NOVA_TEST_NS } from './i18n'
 import { z } from 'zod'
 
 import { SectionPageLayout } from '@/components/layout'
@@ -77,7 +79,7 @@ const DEFAULT_CONFIG: NovaTestConfig = {
 }
 
 export function NovaTest() {
-  const { t } = useTranslation()
+  const { t } = useTranslation(NOVA_TEST_NS)
   const [results, setResults] = useState<NovaRequestResult[]>([])
   const [messages, setMessages] = useState<RabbitMessage[]>([])
   const [advancedOpen, setAdvancedOpen] = useState(false)

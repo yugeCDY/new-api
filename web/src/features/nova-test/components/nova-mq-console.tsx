@@ -30,6 +30,8 @@ import { useEffect, useRef, useState } from 'react'
 import { Controller, useFormContext } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
 
+import { NOVA_TEST_NS } from '../i18n'
+
 import { Button } from '@/components/ui/button'
 import {
   Card,
@@ -71,7 +73,7 @@ type MqConfigFieldProps = {
 }
 
 function MqConfigField(props: MqConfigFieldProps) {
-  const { t } = useTranslation()
+  const { t } = useTranslation(NOVA_TEST_NS)
   const form = useFormContext<NovaTestConfig>()
   const error = form.formState.errors[props.name]
   const id = `nova-mq-${props.name}`
@@ -106,7 +108,7 @@ function actionSummary(result: RabbitActionResult | null): string {
 }
 
 export function NovaMqConsole(props: NovaMqConsoleProps) {
-  const { t } = useTranslation()
+  const { t } = useTranslation(NOVA_TEST_NS)
   const form = useFormContext<NovaTestConfig>()
   const [isDeclaring, setIsDeclaring] = useState(false)
   const [isBinding, setIsBinding] = useState(false)

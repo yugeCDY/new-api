@@ -21,6 +21,8 @@ import { Cable, KeyRound, MessageSquareMore } from 'lucide-react'
 import { useFormContext } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
 
+import { NOVA_TEST_NS } from '../i18n'
+
 import { PasswordInput } from '@/components/password-input'
 import {
   Card,
@@ -49,7 +51,7 @@ type ConfigFieldProps = {
 }
 
 function ConfigField(props: ConfigFieldProps) {
-  const { t } = useTranslation()
+  const { t } = useTranslation(NOVA_TEST_NS)
   const form = useFormContext<NovaTestConfig>()
   const error = form.formState.errors[props.name]
   const id = `nova-test-${props.name}`
@@ -88,7 +90,7 @@ function ConfigField(props: ConfigFieldProps) {
 }
 
 export function NovaConfigPanel() {
-  const { t } = useTranslation()
+  const { t } = useTranslation(NOVA_TEST_NS)
 
   return (
     <div className='grid gap-4 xl:grid-cols-3'>

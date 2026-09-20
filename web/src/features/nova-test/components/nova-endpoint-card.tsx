@@ -22,6 +22,8 @@ import { useState } from 'react'
 import { useFormContext } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
 
+import { NOVA_TEST_NS } from '../i18n'
+
 import { CopyButton } from '@/components/copy-button'
 import { JsonCodeEditor } from '@/components/json-code-editor'
 import {
@@ -96,7 +98,7 @@ function captureOneTimeValues(
 }
 
 export function NovaEndpointCard(props: NovaEndpointCardProps) {
-  const { t } = useTranslation()
+  const { t } = useTranslation(NOVA_TEST_NS)
   const form = useFormContext<NovaTestConfig>()
   const [urlOverride, setUrlOverride] = useState('')
   const [headers, setHeaders] = useState(props.endpoint.headers)

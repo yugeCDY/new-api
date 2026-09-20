@@ -20,6 +20,8 @@ For commercial licensing, please contact support@quantumnous.com
 import { CheckCircle2, CircleX, Clock3, FileJson2 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 
+import { NOVA_TEST_NS } from '../i18n'
+
 import { CopyButton } from '@/components/copy-button'
 import { Button } from '@/components/ui/button'
 import {
@@ -39,7 +41,7 @@ type NovaResultsPanelProps = {
 }
 
 export function NovaResultsPanel(props: NovaResultsPanelProps) {
-  const { t } = useTranslation()
+  const { t } = useTranslation(NOVA_TEST_NS)
 
   return (
     <Card>

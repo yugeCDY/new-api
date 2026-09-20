@@ -41,6 +41,7 @@ import {
 import { useTranslation } from 'react-i18next'
 
 import type { SidebarData } from '@/components/layout/types'
+import { ensureNovaTestI18n, NOVA_TEST_NS } from '@/features/nova-test/i18n'
 import { ROLE } from '@/lib/roles'
 
 /**
@@ -51,6 +52,7 @@ import { ROLE } from '@/lib/roles'
  */
 export function useSidebarData(): SidebarData {
   const { t } = useTranslation()
+  ensureNovaTestI18n()
 
   return {
     navGroups: [
@@ -165,7 +167,7 @@ export function useSidebarData(): SidebarData {
             requiredRole: ROLE.SUPER_ADMIN,
           },
           {
-            title: t('Nova integration lab'),
+            title: t('Nova integration lab', { ns: NOVA_TEST_NS }),
             url: '/nova-test',
             icon: Microscope,
             requiredRole: ROLE.SUPER_ADMIN,

@@ -22,6 +22,8 @@ import { useState } from 'react'
 import { useFormContext } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
 
+import { NOVA_TEST_NS } from '../i18n'
+
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import {
@@ -45,7 +47,7 @@ NOVA_TEST_MODEL=deepseek-v3
 RABBITMQ_URL=amqp://user:password@127.0.0.1:5672/`
 
 export function NovaEnvironmentSetup() {
-  const { t } = useTranslation()
+  const { t } = useTranslation(NOVA_TEST_NS)
   const form = useFormContext<NovaTestConfig>()
   const [environment, setEnvironment] = useState('')
   const [applied, setApplied] = useState(false)

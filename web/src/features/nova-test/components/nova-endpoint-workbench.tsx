@@ -21,6 +21,8 @@ import { Boxes, Sparkles } from 'lucide-react'
 import { useFormContext, useWatch } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
 
+import { NOVA_TEST_NS } from '../i18n'
+
 import { Accordion } from '@/components/ui/accordion'
 import {
   Card,
@@ -39,7 +41,7 @@ type NovaEndpointWorkbenchProps = {
 }
 
 export function NovaEndpointWorkbench(props: NovaEndpointWorkbenchProps) {
-  const { t } = useTranslation()
+  const { t } = useTranslation(NOVA_TEST_NS)
   const form = useFormContext<NovaTestConfig>()
   const baseUrl = useWatch({ control: form.control, name: 'baseUrl' })
   const managementEndpoints = NOVA_ENDPOINTS.filter(
