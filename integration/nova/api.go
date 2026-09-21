@@ -7,6 +7,7 @@ import (
 	"math"
 	"net/http"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -25,7 +26,8 @@ const (
 )
 
 var (
-	tenantKeyPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{2,63}$`)
+	// Align with users.username max length (20).
+	tenantKeyPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{2,19}$`)
 	tokenNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,49}$`)
 )
 
@@ -42,52 +44,75 @@ func newAPIError(status int, code, message string) error {
 }
 
 type createTenantRequest struct {
-	TenantKey   string         `json:"tenant_key"`
-	DisplayName string         `json:"display_name"`
-	Quota       int            `json:"quota"`
-	TokenName   string         `json:"token_name"`
-	TokenQuota  int            `json:"token_quota"`
-	Unlimited   bool           `json:"unlimited_quota"`
-	Metadata    map[string]any `json:"metadata"`
+	TenantKey    string `json:"tenant_key"`
+	TenantName   string `json:"tenant_name"`
+	InitialQuota int    `json:"initial_quota"`
+	RequestID    string `json:"request_id"`
 }
 
 type updateTenantRequest struct {
-	DisplayName string         `json:"display_name"`
-	Metadata    map[string]any `json:"metadata"`
+	RequestID   string `json:"request_id"`
+	DisplayName string `json:"display_name"`
 }
 
 type quotaAdjustmentRequest struct {
-	OperationID string `json:"operation_id"`
-	Delta       int    `json:"delta"`
-	Reason      string `json:"reason"`
+	RequestID     string `json:"request_id"`
+	OrderNo       string `json:"order_no"`
+	DeltaQuota    *int   `json:"delta_quota"`
+	AbsoluteQuota *int   `json:"absolute_quota"`
+	Reason        string `json:"reason"`
+}
+
+type tokenQuotaSetRequest struct {
+	RequestID      string `json:"request_id"`
+	RemainQuota    *int   `json:"remain_quota"`
+	UnlimitedQuota *bool  `json:"unlimited_quota"`
+	Reason         string `json:"reason"`
 }
 
 type rotateTokenRequest struct {
-	OldTokenName string `json:"old_token_name"`
-	NewTokenName string `json:"new_token_name"`
-	TokenQuota   *int   `json:"token_quota,omitempty"`
-	Unlimited    *bool  `json:"unlimited_quota,omitempty"`
+	RequestID string `json:"request_id"`
+	Reason    string `json:"reason"`
+}
+
+type requestIDBody struct {
+	RequestID string `json:"request_id"`
 }
 
 type tenantResponse struct {
-	TenantKey   string `json:"tenant_key"`
-	DisplayName string `json:"display_name"`
-	Status      string `json:"status"`
-	UserID      int    `json:"user_id"`
-	Quota       int    `json:"quota"`
-	CreatedAt   int64  `json:"created_at"`
-	UpdatedAt   int64  `json:"updated_at"`
+	UserID       int    `json:"user_id"`
+	Username     string `json:"username"`
+	DisplayName  string `json:"display_name"`
+	Status       string `json:"status"`
+	Quota        int    `json:"quota"`
+	UsedQuota    int    `json:"used_quota"`
+	TokenName    string `json:"token_name"`
+	TokenKey     string `json:"token_key"`
+	CreatedAt    string `json:"created_at"`
+	LastActiveAt string `json:"last_active_at"`
 }
 
-type tokenResponse struct {
-	Name           string `json:"name"`
-	Token          string `json:"token,omitempty"`
-	MaskedToken    string `json:"masked_token,omitempty"`
-	Status         int    `json:"status"`
+type tenantListItem struct {
+	Username     string `json:"username"`
+	UserID       int    `json:"user_id"`
+	DisplayName  string `json:"display_name"`
+	Status       string `json:"status"`
+	Quota        int    `json:"quota"`
+	UsedQuota    int    `json:"used_quota"`
+	CreatedAt    int64  `json:"created_at"`
+	LastActiveAt int64  `json:"last_active_at"`
+}
+
+type tenantKeyItem struct {
+	TokenID        int    `json:"token_id"`
+	TokenName      string `json:"token_name"`
+	Key            string `json:"key"`
+	Status         string `json:"status"`
+	ExpiredTime    int64  `json:"expired_time"`
 	RemainQuota    int    `json:"remain_quota"`
 	UnlimitedQuota bool   `json:"unlimited_quota"`
-	CreatedAt      int64  `json:"created_at"`
-	SecretVisible  bool   `json:"secret_visible"`
+	UsedQuota      int    `json:"used_quota"`
+	CreatedTime    int64  `json:"created_time"`
 }
 
 func createTenant(c *gin.Context) {
@@ -97,29 +122,22 @@ func createTenant(c *gin.Context) {
 		return
 	}
 	request.TenantKey = strings.TrimSpace(request.TenantKey)
-	request.DisplayName = strings.TrimSpace(request.DisplayName)
-	request.TokenName = strings.TrimSpace(request.TokenName)
-	if request.TokenName == "" {
-		request.TokenName = "default"
-	}
-	if !tenantKeyPattern.MatchString(request.TenantKey) || !tokenNamePattern.MatchString(request.TokenName) || len(request.DisplayName) > 128 {
-		writeAPIError(c, newAPIError(http.StatusBadRequest, "invalid_request", "tenant or token fields are invalid"))
+	request.TenantName = strings.TrimSpace(request.TenantName)
+	request.RequestID = strings.TrimSpace(request.RequestID)
+	if !tenantKeyPattern.MatchString(request.TenantKey) || request.TenantName == "" || len(request.TenantName) > 20 {
+		writeAPIError(c, newAPIError(http.StatusBadRequest, "invalid_request", "tenant fields are invalid"))
 		return
 	}
-	if err := validateQuota(request.Quota); err != nil {
-		writeAPIError(c, err)
+	if !requestIDPattern.MatchString(request.RequestID) {
+		writeAPIError(c, newAPIError(http.StatusBadRequest, "invalid_request", "request_id is invalid"))
 		return
 	}
-	if err := validateQuota(request.TokenQuota); err != nil {
+	if err := validateQuota(request.InitialQuota); err != nil {
 		writeAPIError(c, err)
 		return
 	}
 
-	metadata, err := common.Marshal(request.Metadata)
-	if err != nil {
-		writeAPIError(c, newAPIError(http.StatusBadRequest, "invalid_metadata", "metadata is invalid"))
-		return
-	}
+	tokenName := primaryTokenName(request.TenantKey)
 	tokenKey, err := common.GenerateKey()
 	if err != nil {
 		writeAPIError(c, err)
@@ -136,16 +154,16 @@ func createTenant(c *gin.Context) {
 		return
 	}
 
-	response, err := executeIdempotent(c, "create_tenant:"+request.TenantKey, func(tx *gorm.DB) (mutationResult, error) {
+	response, err := executeIdempotent(c, "create_tenant", request.RequestID, func(tx *gorm.DB) (mutationResult, error) {
 		now := time.Now().Unix()
 		digest := sha256.Sum256([]byte(request.TenantKey))
 		user := model.User{
-			Username:    "nv_" + fmt.Sprintf("%x", digest[:8]),
+			Username:    request.TenantKey,
 			Password:    passwordHash,
-			DisplayName: truncateString(request.DisplayName, 20),
+			DisplayName: request.TenantName,
 			Role:        common.RoleCommonUser,
 			Status:      common.UserStatusEnabled,
-			Quota:       request.Quota,
+			Quota:       request.InitialQuota,
 			Group:       "default",
 			AffCode:     "nv" + fmt.Sprintf("%x", digest[:15]),
 			CreatedAt:   now,
@@ -155,13 +173,9 @@ func createTenant(c *gin.Context) {
 			return mutationResult{}, newAPIError(http.StatusConflict, "tenant_exists", "tenant already exists")
 		}
 		tenant := Tenant{
-			TenantKey:   request.TenantKey,
-			UserID:      user.Id,
-			DisplayName: request.DisplayName,
-			Status:      tenantStatusEnabled,
-			Metadata:    string(metadata),
-			CreatedAt:   now,
-			UpdatedAt:   now,
+			UserID:    user.Id,
+			CreatedAt: now,
+			UpdatedAt: now,
 		}
 		if err := tx.Create(&tenant).Error; err != nil {
 			return mutationResult{}, newAPIError(http.StatusConflict, "tenant_exists", "tenant already exists")
@@ -170,30 +184,26 @@ func createTenant(c *gin.Context) {
 			UserId:         user.Id,
 			Key:            tokenKey,
 			Status:         common.TokenStatusEnabled,
-			Name:           request.TokenName,
+			Name:           tokenName,
 			CreatedTime:    now,
 			AccessedTime:   now,
 			ExpiredTime:    -1,
-			RemainQuota:    request.TokenQuota,
-			UnlimitedQuota: request.Unlimited,
+			RemainQuota:    request.InitialQuota,
+			UnlimitedQuota: false,
 			Group:          "default",
 		}
 		if err := tx.Create(&token).Error; err != nil {
 			return mutationResult{}, err
 		}
 
-		fresh := gin.H{
-			"success": true,
-			"tenant":  toTenantResponse(tenant, user.Quota),
-			"token":   toTokenResponse(token, "sk-"+tokenKey, true),
-		}
-		stored := gin.H{
-			"success": true,
-			"tenant":  toTenantResponse(tenant, user.Quota),
-			"token":   toTokenResponse(token, "", false),
-			"message": "token secret was returned only on the original response",
-		}
-		return mutationResult{FreshResponse: fresh, StoredResponse: stored, ResourceRef: request.TenantKey}, nil
+		body := successBody(gin.H{
+			"user_id":    user.Id,
+			"username":   user.Username,
+			"token_name": token.Name,
+			"token_key":  "sk-" + tokenKey,
+			"quota":      user.Quota,
+		})
+		return mutationResult{FreshResponse: body, StoredResponse: body, ResourceRef: request.TenantKey}, nil
 	})
 	writeIdempotentResponse(c, response, err)
 }
@@ -204,7 +214,12 @@ func getTenant(c *gin.Context) {
 		writeAPIError(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"success": true, "tenant": toTenantResponse(*tenant, user.Quota)})
+	detail, err := buildTenantDetail(*tenant, *user)
+	if err != nil {
+		writeAPIError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, successBody(detail))
 }
 
 func listTenants(c *gin.Context) {
@@ -213,98 +228,203 @@ func listTenants(c *gin.Context) {
 		writeAPIError(c, err)
 		return
 	}
+	status := strings.TrimSpace(c.Query("status"))
+	if status != "" && status != tenantStatusEnabled && status != tenantStatusDisabled && status != tenantStatusDeleted {
+		writeAPIError(c, newAPIError(http.StatusBadRequest, "invalid_request", "invalid status"))
+		return
+	}
+	keyword := strings.ToLower(strings.TrimSpace(c.Query("keyword")))
 	_, db := currentState()
-	var tenants []Tenant
+	filtered := db.Table("nova_tenants AS t").Joins("INNER JOIN users AS u ON u.id = t.user_id")
+	switch status {
+	case tenantStatusDeleted:
+		filtered = filtered.Where("u.deleted_at IS NOT NULL")
+	case tenantStatusEnabled:
+		filtered = filtered.Where("u.deleted_at IS NULL AND u.status = ?", common.UserStatusEnabled)
+	case tenantStatusDisabled:
+		filtered = filtered.Where("u.deleted_at IS NULL AND u.status = ?", common.UserStatusDisabled)
+	}
+	if keyword != "" {
+		pattern := "%" + keyword + "%"
+		filtered = filtered.Where("LOWER(u.username) LIKE ? OR LOWER(u.display_name) LIKE ?", pattern, pattern)
+	}
+
 	var total int64
-	query := db.Model(&Tenant{})
-	if err := query.Count(&total).Error; err != nil {
+	if err := filtered.Count(&total).Error; err != nil {
 		writeAPIError(c, err)
 		return
 	}
-	if err := query.Order("id DESC").Limit(pageSize).Offset((page - 1) * pageSize).Find(&tenants).Error; err != nil {
+	var rows []struct {
+		TenantID    int64
+		UserID      int
+		Username    string
+		DisplayName string
+		UserStatus  int
+		DeletedAt   gorm.DeletedAt
+		Quota       int
+		UsedQuota   int
+		LastLoginAt int64
+		CreatedAt   int64
+	}
+	if err := filtered.Select("t.id AS tenant_id, t.user_id, u.username, u.display_name, u.status AS user_status, u.deleted_at, u.quota, u.used_quota, u.last_login_at, t.created_at").
+		Order("t.id DESC").Limit(pageSize).Offset((page - 1) * pageSize).Scan(&rows).Error; err != nil {
 		writeAPIError(c, err)
 		return
 	}
-	items := make([]tenantResponse, 0, len(tenants))
-	for _, tenant := range tenants {
-		var user model.User
-		if err := db.Select("id", "quota").First(&user, tenant.UserID).Error; err != nil {
+
+	tenantIDs := make([]int64, 0, len(rows))
+	for _, row := range rows {
+		tenantIDs = append(tenantIDs, row.TenantID)
+	}
+	lastUsage := map[int64]int64{}
+	if len(tenantIDs) > 0 {
+		var usageRows []struct {
+			TenantID int64 `gorm:"column:tenant_id"`
+			LastAt   int64 `gorm:"column:last_at"`
+		}
+		if err := db.Model(&UsageEvent{}).Select("tenant_id, MAX(occurred_at) AS last_at").Where("tenant_id IN ?", tenantIDs).Group("tenant_id").Scan(&usageRows).Error; err != nil {
 			writeAPIError(c, err)
 			return
 		}
-		items = append(items, toTenantResponse(tenant, user.Quota))
+		for _, row := range usageRows {
+			lastUsage[row.TenantID] = row.LastAt
+		}
 	}
-	c.JSON(http.StatusOK, gin.H{"success": true, "data": items, "page": page, "page_size": pageSize, "total": total})
+
+	items := make([]tenantListItem, 0, len(rows))
+	for _, row := range rows {
+		user := model.User{Status: row.UserStatus, DeletedAt: row.DeletedAt, LastLoginAt: row.LastLoginAt}
+		lastActive := row.LastLoginAt
+		if lastUsage[row.TenantID] > lastActive {
+			lastActive = lastUsage[row.TenantID]
+		}
+		items = append(items, tenantListItem{
+			Username:     row.Username,
+			UserID:       row.UserID,
+			DisplayName:  row.DisplayName,
+			Status:       tenantStatusFromUser(user),
+			Quota:        row.Quota,
+			UsedQuota:    row.UsedQuota,
+			CreatedAt:    row.CreatedAt,
+			LastActiveAt: lastActive,
+		})
+	}
+	c.JSON(http.StatusOK, successBody(gin.H{
+		"total":     total,
+		"page":      page,
+		"page_size": pageSize,
+		"items":     items,
+	}))
 }
 
 func updateTenant(c *gin.Context) {
 	var request updateTenantRequest
-	if err := c.ShouldBindJSON(&request); err != nil || len(request.DisplayName) > 128 {
+	if err := c.ShouldBindJSON(&request); err != nil {
 		writeAPIError(c, newAPIError(http.StatusBadRequest, "invalid_request", "invalid request body"))
 		return
 	}
-	metadata, err := common.Marshal(request.Metadata)
-	if err != nil {
-		writeAPIError(c, newAPIError(http.StatusBadRequest, "invalid_metadata", "metadata is invalid"))
+	displayName := strings.TrimSpace(request.DisplayName)
+	if displayName == "" || len(displayName) > 20 {
+		writeAPIError(c, newAPIError(http.StatusBadRequest, "invalid_request", "display_name is invalid"))
+		return
+	}
+	if !requestIDPattern.MatchString(strings.TrimSpace(request.RequestID)) {
+		writeAPIError(c, newAPIError(http.StatusBadRequest, "invalid_request", "request_id is invalid"))
 		return
 	}
 	tenantKey := c.Param("tenant_key")
-	response, err := executeIdempotent(c, "update_tenant:"+tenantKey, func(tx *gorm.DB) (mutationResult, error) {
-		tenant, err := lockTenant(tx, tenantKey)
+	response, err := executeIdempotent(c, "update_tenant:"+tenantKey, strings.TrimSpace(request.RequestID), func(tx *gorm.DB) (mutationResult, error) {
+		tenant, user, err := lockTenant(tx, tenantKey)
 		if err != nil {
 			return mutationResult{}, err
 		}
-		if err := ensureTenantMutable(tenant); err != nil {
+		if err := ensureTenantMutable(user); err != nil {
 			return mutationResult{}, err
 		}
 		now := time.Now().Unix()
-		if err := tx.Model(&tenant).Updates(map[string]any{"display_name": strings.TrimSpace(request.DisplayName), "metadata": string(metadata), "updated_at": now}).Error; err != nil {
+		if err := tx.Model(&model.User{}).Where("id = ?", tenant.UserID).Updates(map[string]any{
+			"display_name": displayName,
+		}).Error; err != nil {
 			return mutationResult{}, err
 		}
-		tenant.DisplayName = strings.TrimSpace(request.DisplayName)
+		if err := tx.Model(&tenant).Update("updated_at", now).Error; err != nil {
+			return mutationResult{}, err
+		}
 		tenant.UpdatedAt = now
-		var user model.User
-		if err := tx.Select("id", "quota").First(&user, tenant.UserID).Error; err != nil {
+		if err := tx.Unscoped().Select("id", "username", "display_name", "status", "quota", "used_quota", "last_login_at", "deleted_at").First(&user, tenant.UserID).Error; err != nil {
 			return mutationResult{}, err
 		}
-		body := gin.H{"success": true, "tenant": toTenantResponse(tenant, user.Quota)}
-		return mutationResult{FreshResponse: body, StoredResponse: body, ResourceRef: tenantKey}, nil
+		detail, err := buildTenantDetail(tenant, user)
+		if err != nil {
+			return mutationResult{}, err
+		}
+		body := successBody(detail)
+		return mutationResult{
+			FreshResponse:  body,
+			StoredResponse: body,
+			ResourceRef:    tenantKey,
+			AfterCommit:    func() { _ = model.InvalidateUserCache(tenant.UserID) },
+		}, nil
 	})
 	writeIdempotentResponse(c, response, err)
 }
 
 func setTenantStatus(c *gin.Context, status string) {
+	var request requestIDBody
+	if err := c.ShouldBindJSON(&request); err != nil {
+		writeAPIError(c, newAPIError(http.StatusBadRequest, "invalid_request", "request_id is required"))
+		return
+	}
+	requestID := strings.TrimSpace(request.RequestID)
+	if !requestIDPattern.MatchString(requestID) {
+		writeAPIError(c, newAPIError(http.StatusBadRequest, "invalid_request", "request_id is invalid"))
+		return
+	}
 	tenantKey := c.Param("tenant_key")
-	response, err := executeIdempotent(c, "tenant_status:"+status+":"+tenantKey, func(tx *gorm.DB) (mutationResult, error) {
-		tenant, err := lockTenant(tx, tenantKey)
+	response, err := executeIdempotent(c, "tenant_status:"+status+":"+tenantKey, requestID, func(tx *gorm.DB) (mutationResult, error) {
+		tenant, user, err := lockTenant(tx, tenantKey)
 		if err != nil {
 			return mutationResult{}, err
 		}
-		if tenant.Status == tenantStatusDeleted && status != tenantStatusDeleted {
+		if user.DeletedAt.Valid && status != tenantStatusDeleted {
 			return mutationResult{}, newAPIError(http.StatusConflict, "tenant_deleted", "deleted tenant cannot be re-enabled or modified")
-		}
-		userStatus := common.UserStatusEnabled
-		if status != tenantStatusEnabled {
-			userStatus = common.UserStatusDisabled
 		}
 		if _, err := model.IncrementUserAuthVersionWithTx(tx, tenant.UserID); err != nil {
 			return mutationResult{}, err
 		}
-		if err := tx.Model(&model.User{}).Where("id = ?", tenant.UserID).Update("status", userStatus).Error; err != nil {
-			return mutationResult{}, err
-		}
-		if status != tenantStatusEnabled {
+		now := time.Now().Unix()
+		switch status {
+		case tenantStatusEnabled:
+			if err := tx.Unscoped().Model(&model.User{}).Where("id = ?", tenant.UserID).Updates(map[string]any{
+				"status":     common.UserStatusEnabled,
+				"deleted_at": nil,
+			}).Error; err != nil {
+				return mutationResult{}, err
+			}
+		case tenantStatusDisabled:
+			if err := tx.Model(&model.User{}).Where("id = ?", tenant.UserID).Update("status", common.UserStatusDisabled).Error; err != nil {
+				return mutationResult{}, err
+			}
 			if err := tx.Model(&model.Token{}).Where("user_id = ?", tenant.UserID).Update("status", common.TokenStatusDisabled).Error; err != nil {
 				return mutationResult{}, err
 			}
+		case tenantStatusDeleted:
+			if err := tx.Model(&model.User{}).Where("id = ?", tenant.UserID).Update("status", common.UserStatusDisabled).Error; err != nil {
+				return mutationResult{}, err
+			}
+			if err := tx.Model(&model.Token{}).Where("user_id = ?", tenant.UserID).Update("status", common.TokenStatusDisabled).Error; err != nil {
+				return mutationResult{}, err
+			}
+			if err := tx.Delete(&model.User{}, tenant.UserID).Error; err != nil {
+				return mutationResult{}, err
+			}
+		default:
+			return mutationResult{}, newAPIError(http.StatusBadRequest, "invalid_request", "invalid status")
 		}
-		now := time.Now().Unix()
-		if err := tx.Model(&tenant).Updates(map[string]any{"status": status, "updated_at": now}).Error; err != nil {
+		if err := tx.Model(&tenant).Update("updated_at", now).Error; err != nil {
 			return mutationResult{}, err
 		}
-		tenant.Status = status
-		tenant.UpdatedAt = now
-		body := gin.H{"success": true, "tenant_key": tenantKey, "status": status}
+		body := successBody(gin.H{"username": tenantKey, "status": status})
 		return mutationResult{
 			FreshResponse:  body,
 			StoredResponse: body,
@@ -324,51 +444,73 @@ func deleteTenant(c *gin.Context) {
 
 func adjustTenantQuota(c *gin.Context) {
 	var request quotaAdjustmentRequest
-	if err := c.ShouldBindJSON(&request); err != nil || !validOperationID(request.OperationID) || strings.TrimSpace(request.Reason) == "" || len(request.Reason) > 255 {
+	if err := c.ShouldBindJSON(&request); err != nil {
 		writeAPIError(c, newAPIError(http.StatusBadRequest, "invalid_request", "invalid quota adjustment"))
 		return
 	}
-	if err := validateQuotaDelta(request.Delta); err != nil {
+	request.OrderNo = strings.TrimSpace(request.OrderNo)
+	request.Reason = strings.TrimSpace(request.Reason)
+	request.RequestID = strings.TrimSpace(request.RequestID)
+	if !validOrderNo(request.OrderNo) || request.Reason == "" || len(request.Reason) > 255 {
+		writeAPIError(c, newAPIError(http.StatusBadRequest, "invalid_request", "invalid quota adjustment"))
+		return
+	}
+	if !requestIDPattern.MatchString(request.RequestID) {
+		writeAPIError(c, newAPIError(http.StatusBadRequest, "invalid_request", "request_id is invalid"))
+		return
+	}
+	if err := validateQuotaAdjustmentMode(request); err != nil {
 		writeAPIError(c, err)
 		return
 	}
 	tenantKey := c.Param("tenant_key")
-	response, err := executeIdempotent(c, "tenant_quota:"+tenantKey, func(tx *gorm.DB) (mutationResult, error) {
-		tenant, err := lockTenant(tx, tenantKey)
+	response, err := executeIdempotent(c, "tenant_quota:"+tenantKey, request.RequestID, func(tx *gorm.DB) (mutationResult, error) {
+		tenant, user, err := lockTenant(tx, tenantKey)
 		if err != nil {
 			return mutationResult{}, err
 		}
-		if err := ensureTenantMutable(tenant); err != nil {
+		if err := ensureTenantMutable(user); err != nil {
 			return mutationResult{}, err
 		}
 		if existing, replay, err := loadQuotaOperation(tx, tenantKey, quotaTargetTenant, "", request); err != nil {
 			return mutationResult{}, err
 		} else if replay {
-			body := gin.H{"success": true, "tenant_key": tenantKey, "quota": existing.ResultQuota, "operation_id": request.OperationID, "replayed": true}
+			body := successBody(quotaAdjustmentResponse(tenantKey, existing.ResultQuota-existing.Delta, existing.ResultQuota, existing.Delta, request.OrderNo, request.Reason, true))
 			return mutationResult{FreshResponse: body, StoredResponse: body, ResourceRef: tenantKey}, nil
 		}
 
-		query := tx.Model(&model.User{}).Where("id = ?", tenant.UserID)
-		if request.Delta > 0 {
-			query = query.Where("quota <= ?", common.MaxWalletQuota-request.Delta)
+		quotaBefore := user.Quota
+		var delta int
+		if request.AbsoluteQuota != nil {
+			delta = *request.AbsoluteQuota - quotaBefore
 		} else {
-			query = query.Where("quota >= ?", -request.Delta)
+			delta = *request.DeltaQuota
 		}
-		result := query.Update("quota", gorm.Expr("quota + ?", request.Delta))
-		if result.Error != nil {
-			return mutationResult{}, result.Error
+		if err := validateQuotaDelta(delta); err != nil {
+			return mutationResult{}, err
 		}
-		if result.RowsAffected != 1 {
-			return mutationResult{}, newAPIError(http.StatusConflict, "quota_out_of_range", "quota adjustment would exceed allowed bounds")
+		if delta != 0 {
+			query := tx.Model(&model.User{}).Where("id = ?", tenant.UserID)
+			if delta > 0 {
+				query = query.Where("quota <= ?", common.MaxWalletQuota-delta)
+			} else {
+				query = query.Where("quota >= ?", -delta)
+			}
+			result := query.Update("quota", gorm.Expr("quota + ?", delta))
+			if result.Error != nil {
+				return mutationResult{}, result.Error
+			}
+			if result.RowsAffected != 1 {
+				return mutationResult{}, newAPIError(http.StatusConflict, "quota_out_of_range", "quota adjustment would exceed allowed bounds")
+			}
 		}
-		var user model.User
 		if err := tx.Select("id", "quota").First(&user, tenant.UserID).Error; err != nil {
 			return mutationResult{}, err
 		}
-		if err := createQuotaOperation(tx, tenantKey, quotaTargetTenant, "", request, user.Quota); err != nil {
+		if err := createQuotaOperation(tx, tenantKey, quotaTargetTenant, "", request, delta, user.Quota); err != nil {
 			return mutationResult{}, err
 		}
-		body := gin.H{"success": true, "tenant_key": tenantKey, "quota": user.Quota, "operation_id": request.OperationID}
+		body := successBody(quotaAdjustmentResponse(tenantKey, quotaBefore, user.Quota, delta, request.OrderNo, request.Reason, false))
 		return mutationResult{FreshResponse: body, StoredResponse: body, ResourceRef: tenantKey, AfterCommit: func() { _ = model.InvalidateUserCache(tenant.UserID) }}, nil
 	})
 	writeIdempotentResponse(c, response, err)
@@ -386,24 +528,28 @@ func listTokens(c *gin.Context) {
 		writeAPIError(c, err)
 		return
 	}
-	items := make([]tokenResponse, 0, len(tokens))
+	items := make([]tenantKeyItem, 0, len(tokens))
 	for _, token := range tokens {
-		items = append(items, toTokenResponse(token, "", false))
+		items = append(items, toTenantKeyItem(token))
 	}
-	c.JSON(http.StatusOK, gin.H{"success": true, "data": items})
+	c.JSON(http.StatusOK, successBody(gin.H{"items": items}))
 }
 
 func rotateToken(c *gin.Context) {
 	var request rotateTokenRequest
-	if err := c.ShouldBindJSON(&request); err != nil || !tokenNamePattern.MatchString(request.OldTokenName) || !tokenNamePattern.MatchString(request.NewTokenName) {
+	if err := c.ShouldBindJSON(&request); err != nil {
 		writeAPIError(c, newAPIError(http.StatusBadRequest, "invalid_request", "invalid token rotation request"))
 		return
 	}
-	if request.TokenQuota != nil {
-		if err := validateQuota(*request.TokenQuota); err != nil {
-			writeAPIError(c, err)
-			return
-		}
+	request.RequestID = strings.TrimSpace(request.RequestID)
+	request.Reason = strings.TrimSpace(request.Reason)
+	if !requestIDPattern.MatchString(request.RequestID) {
+		writeAPIError(c, newAPIError(http.StatusBadRequest, "invalid_request", "request_id is invalid"))
+		return
+	}
+	if request.Reason == "" || len(request.Reason) > 255 {
+		writeAPIError(c, newAPIError(http.StatusBadRequest, "invalid_request", "reason is required"))
+		return
 	}
 	newKey, err := common.GenerateKey()
 	if err != nil {
@@ -411,115 +557,112 @@ func rotateToken(c *gin.Context) {
 		return
 	}
 	tenantKey := c.Param("tenant_key")
-	response, err := executeIdempotent(c, "rotate_token:"+tenantKey+":"+request.OldTokenName, func(tx *gorm.DB) (mutationResult, error) {
-		tenant, err := lockTenant(tx, tenantKey)
+	response, err := executeIdempotent(c, "rotate_token:"+tenantKey, request.RequestID, func(tx *gorm.DB) (mutationResult, error) {
+		tenant, user, err := lockTenant(tx, tenantKey)
 		if err != nil {
 			return mutationResult{}, err
 		}
-		if err := ensureTenantMutable(tenant); err != nil {
+		if err := ensureTenantMutable(user); err != nil {
 			return mutationResult{}, err
 		}
-		var oldToken model.Token
-		if err := tx.Where("user_id = ? AND name = ?", tenant.UserID, request.OldTokenName).First(&oldToken).Error; err != nil {
-			return mutationResult{}, newAPIError(http.StatusNotFound, "token_not_found", "token not found")
-		}
-		var duplicateCount int64
-		if err := tx.Model(&model.Token{}).Where("user_id = ? AND name = ?", tenant.UserID, request.NewTokenName).Count(&duplicateCount).Error; err != nil {
+		token, err := loadPrimaryToken(tx, tenant.UserID, tenantKey)
+		if err != nil {
 			return mutationResult{}, err
 		}
-		if duplicateCount > 0 {
-			return mutationResult{}, newAPIError(http.StatusConflict, "token_exists", "new token name already exists")
-		}
-		quota := oldToken.RemainQuota
-		if request.TokenQuota != nil {
-			quota = *request.TokenQuota
-		}
-		unlimited := oldToken.UnlimitedQuota
-		if request.Unlimited != nil {
-			unlimited = *request.Unlimited
-		}
+		oldName := token.Name
 		now := time.Now().Unix()
-		newToken := model.Token{UserId: tenant.UserID, Key: newKey, Status: common.TokenStatusEnabled, Name: request.NewTokenName, CreatedTime: now, AccessedTime: now, ExpiredTime: -1, RemainQuota: quota, UnlimitedQuota: unlimited, Group: oldToken.Group}
-		if err := tx.Create(&newToken).Error; err != nil {
-			return mutationResult{}, newAPIError(http.StatusConflict, "token_exists", "new token name already exists")
-		}
-		if err := tx.Model(&oldToken).Update("status", common.TokenStatusDisabled).Error; err != nil {
+		if err := tx.Model(&token).Updates(map[string]any{
+			"key":           newKey,
+			"status":        common.TokenStatusEnabled,
+			"accessed_time": now,
+		}).Error; err != nil {
 			return mutationResult{}, err
 		}
-		fresh := gin.H{"success": true, "token": toTokenResponse(newToken, "sk-"+newKey, true)}
-		stored := gin.H{"success": true, "token": toTokenResponse(newToken, "", false), "message": "token secret was returned only on the original response"}
-		return mutationResult{FreshResponse: fresh, StoredResponse: stored, ResourceRef: request.NewTokenName, AfterCommit: func() { _ = model.InvalidateUserTokensCache(tenant.UserID) }}, nil
+		body := successBody(gin.H{
+			"old_token_name": oldName,
+			"token_name":     oldName,
+			"token_key":      "sk-" + newKey,
+		})
+		return mutationResult{FreshResponse: body, StoredResponse: body, ResourceRef: oldName, AfterCommit: func() { _ = model.InvalidateUserTokensCache(tenant.UserID) }}, nil
 	})
 	writeIdempotentResponse(c, response, err)
 }
 
 func adjustTokenQuota(c *gin.Context) {
-	var request quotaAdjustmentRequest
-	if err := c.ShouldBindJSON(&request); err != nil || !validOperationID(request.OperationID) || strings.TrimSpace(request.Reason) == "" || len(request.Reason) > 255 || !tokenNamePattern.MatchString(c.Param("token_name")) {
-		writeAPIError(c, newAPIError(http.StatusBadRequest, "invalid_request", "invalid quota adjustment"))
+	var request tokenQuotaSetRequest
+	if err := c.ShouldBindJSON(&request); err != nil || !tokenNamePattern.MatchString(c.Param("token_name")) {
+		writeAPIError(c, newAPIError(http.StatusBadRequest, "invalid_request", "invalid token quota request"))
 		return
 	}
-	if err := validateQuotaDelta(request.Delta); err != nil {
+	request.RequestID = strings.TrimSpace(request.RequestID)
+	request.Reason = strings.TrimSpace(request.Reason)
+	if !requestIDPattern.MatchString(request.RequestID) {
+		writeAPIError(c, newAPIError(http.StatusBadRequest, "invalid_request", "request_id is invalid"))
+		return
+	}
+	if request.RemainQuota == nil || request.UnlimitedQuota == nil || request.Reason == "" || len(request.Reason) > 255 {
+		writeAPIError(c, newAPIError(http.StatusBadRequest, "invalid_request", "remain_quota, unlimited_quota and reason are required"))
+		return
+	}
+	if err := validateQuota(*request.RemainQuota); err != nil {
 		writeAPIError(c, err)
 		return
 	}
 	tenantKey := c.Param("tenant_key")
 	tokenName := c.Param("token_name")
-	response, err := executeIdempotent(c, "token_quota:"+tenantKey+":"+tokenName, func(tx *gorm.DB) (mutationResult, error) {
-		tenant, err := lockTenant(tx, tenantKey)
+	response, err := executeIdempotent(c, "token_quota:"+tenantKey+":"+tokenName, request.RequestID, func(tx *gorm.DB) (mutationResult, error) {
+		tenant, user, err := lockTenant(tx, tenantKey)
 		if err != nil {
 			return mutationResult{}, err
 		}
-		if err := ensureTenantMutable(tenant); err != nil {
+		if err := ensureTenantMutable(user); err != nil {
 			return mutationResult{}, err
-		}
-		if existing, replay, err := loadQuotaOperation(tx, tenantKey, quotaTargetToken, tokenName, request); err != nil {
-			return mutationResult{}, err
-		} else if replay {
-			var token model.Token
-			if err := tx.Where("user_id = ? AND name = ?", tenant.UserID, tokenName).First(&token).Error; err != nil {
-				return mutationResult{}, err
-			}
-			token.RemainQuota = existing.ResultQuota
-			body := gin.H{"success": true, "tenant_key": tenantKey, "token": toTokenResponse(token, "", false), "operation_id": request.OperationID, "replayed": true}
-			return mutationResult{FreshResponse: body, StoredResponse: body, ResourceRef: tokenName}, nil
-		}
-
-		query := tx.Model(&model.Token{}).Where("user_id = ? AND name = ?", tenant.UserID, tokenName)
-		if request.Delta > 0 {
-			query = query.Where("remain_quota <= ?", common.MaxWalletQuota-request.Delta)
-		} else {
-			query = query.Where("remain_quota >= ?", -request.Delta)
-		}
-		result := query.Update("remain_quota", gorm.Expr("remain_quota + ?", request.Delta))
-		if result.Error != nil {
-			return mutationResult{}, result.Error
-		}
-		if result.RowsAffected != 1 {
-			return mutationResult{}, newAPIError(http.StatusConflict, "quota_out_of_range", "quota adjustment would exceed allowed bounds")
 		}
 		var token model.Token
 		if err := tx.Where("user_id = ? AND name = ?", tenant.UserID, tokenName).First(&token).Error; err != nil {
+			return mutationResult{}, newAPIError(http.StatusNotFound, "token_not_found", "token not found")
+		}
+		updates := map[string]any{
+			"remain_quota":    *request.RemainQuota,
+			"unlimited_quota": *request.UnlimitedQuota,
+		}
+		if *request.UnlimitedQuota || *request.RemainQuota > 0 {
+			if token.Status == common.TokenStatusExhausted {
+				updates["status"] = common.TokenStatusEnabled
+			}
+		}
+		if err := tx.Model(&token).Updates(updates).Error; err != nil {
 			return mutationResult{}, err
 		}
-		if err := createQuotaOperation(tx, tenantKey, quotaTargetToken, tokenName, request, token.RemainQuota); err != nil {
-			return mutationResult{}, err
-		}
-		body := gin.H{"success": true, "tenant_key": tenantKey, "token": toTokenResponse(token, "", false), "operation_id": request.OperationID}
+		body := successBody(gin.H{
+			"token_name":      tokenName,
+			"remain_quota":    *request.RemainQuota,
+			"unlimited_quota": *request.UnlimitedQuota,
+		})
 		return mutationResult{FreshResponse: body, StoredResponse: body, ResourceRef: tokenName, AfterCommit: func() { _ = model.InvalidateUserTokensCache(tenant.UserID) }}, nil
 	})
 	writeIdempotentResponse(c, response, err)
 }
 
 func deleteToken(c *gin.Context) {
+	var request requestIDBody
+	if err := c.ShouldBindJSON(&request); err != nil {
+		writeAPIError(c, newAPIError(http.StatusBadRequest, "invalid_request", "request_id is required"))
+		return
+	}
+	requestID := strings.TrimSpace(request.RequestID)
+	if !requestIDPattern.MatchString(requestID) {
+		writeAPIError(c, newAPIError(http.StatusBadRequest, "invalid_request", "request_id is invalid"))
+		return
+	}
 	tenantKey := c.Param("tenant_key")
 	tokenName := c.Param("token_name")
-	response, err := executeIdempotent(c, "delete_token:"+tenantKey+":"+tokenName, func(tx *gorm.DB) (mutationResult, error) {
-		tenant, err := lockTenant(tx, tenantKey)
+	response, err := executeIdempotent(c, "delete_token:"+tenantKey+":"+tokenName, requestID, func(tx *gorm.DB) (mutationResult, error) {
+		tenant, user, err := lockTenant(tx, tenantKey)
 		if err != nil {
 			return mutationResult{}, err
 		}
-		if err := ensureTenantMutable(tenant); err != nil {
+		if err := ensureTenantMutable(user); err != nil {
 			return mutationResult{}, err
 		}
 		result := tx.Model(&model.Token{}).Where("user_id = ? AND name = ?", tenant.UserID, tokenName).Update("status", common.TokenStatusDisabled)
@@ -529,14 +672,117 @@ func deleteToken(c *gin.Context) {
 		if result.RowsAffected != 1 {
 			return mutationResult{}, newAPIError(http.StatusNotFound, "token_not_found", "token not found")
 		}
-		body := gin.H{"success": true, "tenant_key": tenantKey, "token_name": tokenName, "status": common.TokenStatusDisabled}
+		body := successBody(gin.H{"username": tenantKey, "token_name": tokenName, "status": common.TokenStatusDisabled})
 		return mutationResult{FreshResponse: body, StoredResponse: body, ResourceRef: tokenName, AfterCommit: func() { _ = model.InvalidateUserTokensCache(tenant.UserID) }}, nil
 	})
 	writeIdempotentResponse(c, response, err)
 }
 
+type modelCatalogItem struct {
+	ModelName              string   `json:"model_name"`
+	ChannelCount           int      `json:"channel_count"`
+	Enabled                bool     `json:"enabled"`
+	Description            string   `json:"description,omitempty"`
+	Tags                   string   `json:"tags,omitempty"`
+	VendorName             string   `json:"vendor_name,omitempty"`
+	QuotaType              int      `json:"quota_type"`
+	ModelRatio             *float64 `json:"model_ratio,omitempty"`
+	ModelPrice             *float64 `json:"model_price,omitempty"`
+	CompletionRatio        *float64 `json:"completion_ratio,omitempty"`
+	CacheRatio             *float64 `json:"cache_ratio,omitempty"`
+	CreateCacheRatio       *float64 `json:"create_cache_ratio,omitempty"`
+	ImageRatio             *float64 `json:"image_ratio,omitempty"`
+	AudioRatio             *float64 `json:"audio_ratio,omitempty"`
+	AudioCompletionRatio   *float64 `json:"audio_completion_ratio,omitempty"`
+	EnableGroups           []string `json:"enable_groups"`
+	SupportedEndpointTypes []string `json:"supported_endpoint_types"`
+}
+
 func listModels(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"success": true, "data": model.GetPricing()})
+	items, err := modelCatalog()
+	if err != nil {
+		writeAPIError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, successBody(gin.H{"items": items}))
+}
+
+func modelCatalog() ([]modelCatalogItem, error) {
+	if model.DB == nil {
+		return []modelCatalogItem{}, nil
+	}
+	counts, err := enabledChannelCounts(model.DB)
+	if err != nil {
+		return nil, err
+	}
+	vendors := map[int]string{}
+	for _, vendor := range model.GetVendors() {
+		vendors[vendor.ID] = vendor.Name
+	}
+	pricing := model.GetPricing()
+	items := make([]modelCatalogItem, 0, len(pricing))
+	for _, item := range pricing {
+		endpoints := make([]string, 0, len(item.SupportedEndpointTypes))
+		for _, endpoint := range item.SupportedEndpointTypes {
+			endpoints = append(endpoints, string(endpoint))
+		}
+		groups := item.EnableGroup
+		if groups == nil {
+			groups = []string{}
+		}
+		entry := modelCatalogItem{
+			ModelName:              item.ModelName,
+			ChannelCount:           counts[item.ModelName],
+			Enabled:                counts[item.ModelName] > 0,
+			Description:            item.Description,
+			Tags:                   item.Tags,
+			VendorName:             vendors[item.VendorID],
+			QuotaType:              item.QuotaType,
+			CacheRatio:             item.CacheRatio,
+			CreateCacheRatio:       item.CreateCacheRatio,
+			ImageRatio:             item.ImageRatio,
+			AudioRatio:             item.AudioRatio,
+			AudioCompletionRatio:   item.AudioCompletionRatio,
+			EnableGroups:           groups,
+			SupportedEndpointTypes: endpoints,
+		}
+		if item.QuotaType == 1 {
+			price := item.ModelPrice
+			entry.ModelPrice = &price
+		} else {
+			ratio := item.ModelRatio
+			completion := item.CompletionRatio
+			entry.ModelRatio = &ratio
+			entry.CompletionRatio = &completion
+		}
+		items = append(items, entry)
+	}
+	slices.SortFunc(items, func(a, b modelCatalogItem) int {
+		return strings.Compare(a.ModelName, b.ModelName)
+	})
+	return items, nil
+}
+
+func enabledChannelCounts(db *gorm.DB) (map[string]int, error) {
+	var rows []struct {
+		Model     string `gorm:"column:model"`
+		ChannelId int    `gorm:"column:channel_id"`
+	}
+	if err := db.Model(&model.Ability{}).Select("model", "channel_id").Where("enabled = ?", true).Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	channels := map[string]map[int]struct{}{}
+	for _, row := range rows {
+		if channels[row.Model] == nil {
+			channels[row.Model] = map[int]struct{}{}
+		}
+		channels[row.Model][row.ChannelId] = struct{}{}
+	}
+	counts := make(map[string]int, len(channels))
+	for name, ids := range channels {
+		counts[name] = len(ids)
+	}
+	return counts, nil
 }
 
 func listUsageLogs(c *gin.Context) {
@@ -562,7 +808,7 @@ func listUsageLogs(c *gin.Context) {
 		writeAPIError(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"success": true, "data": events, "page": page, "page_size": pageSize, "total": total})
+	c.JSON(http.StatusOK, successListBody(events, page, pageSize, total))
 }
 
 func loadTenant(tenantKey string) (*Tenant, *model.User, error) {
@@ -570,13 +816,14 @@ func loadTenant(tenantKey string) (*Tenant, *model.User, error) {
 		return nil, nil, newAPIError(http.StatusNotFound, "tenant_not_found", "tenant not found")
 	}
 	_, db := currentState()
-	var tenant Tenant
-	if err := db.Where("tenant_key = ?", tenantKey).First(&tenant).Error; err != nil {
+	var user model.User
+	if err := db.Unscoped().Select("id", "username", "display_name", "status", "quota", "used_quota", "last_login_at", "deleted_at").
+		Where("username = ?", tenantKey).First(&user).Error; err != nil {
 		return nil, nil, tenantLookupError(err)
 	}
-	var user model.User
-	if err := db.Select("id", "quota").First(&user, tenant.UserID).Error; err != nil {
-		return nil, nil, err
+	var tenant Tenant
+	if err := db.Where("user_id = ?", user.Id).First(&tenant).Error; err != nil {
+		return nil, nil, tenantLookupError(err)
 	}
 	return &tenant, &user, nil
 }
@@ -588,23 +835,40 @@ func tenantLookupError(err error) error {
 	return err
 }
 
-func lockTenant(tx *gorm.DB, tenantKey string) (Tenant, error) {
+func lockTenant(tx *gorm.DB, tenantKey string) (Tenant, model.User, error) {
+	if !tenantKeyPattern.MatchString(tenantKey) {
+		return Tenant{}, model.User{}, newAPIError(http.StatusNotFound, "tenant_not_found", "tenant not found")
+	}
+	var user model.User
+	if err := tx.Unscoped().Where("username = ?", tenantKey).First(&user).Error; err != nil {
+		return Tenant{}, model.User{}, tenantLookupError(err)
+	}
 	query := tx
 	if tx.Dialector.Name() != "sqlite" {
 		query = query.Clauses(clause.Locking{Strength: "UPDATE"})
 	}
 	var tenant Tenant
-	if err := query.Where("tenant_key = ?", tenantKey).First(&tenant).Error; err != nil {
-		return Tenant{}, tenantLookupError(err)
+	if err := query.Where("user_id = ?", user.Id).First(&tenant).Error; err != nil {
+		return Tenant{}, model.User{}, tenantLookupError(err)
 	}
-	return tenant, nil
+	return tenant, user, nil
 }
 
-func ensureTenantMutable(tenant Tenant) error {
-	if tenant.Status == tenantStatusDeleted {
+func ensureTenantMutable(user model.User) error {
+	if user.DeletedAt.Valid {
 		return newAPIError(http.StatusConflict, "tenant_deleted", "deleted tenant cannot be modified")
 	}
 	return nil
+}
+
+func tenantStatusFromUser(user model.User) string {
+	if user.DeletedAt.Valid {
+		return tenantStatusDeleted
+	}
+	if user.Status == common.UserStatusDisabled {
+		return tenantStatusDisabled
+	}
+	return tenantStatusEnabled
 }
 
 func validateQuota(quota int) error {
@@ -621,11 +885,35 @@ func validateQuotaDelta(delta int) error {
 	return nil
 }
 
+func validateQuotaAdjustmentMode(request quotaAdjustmentRequest) error {
+	hasDelta := request.DeltaQuota != nil
+	hasAbsolute := request.AbsoluteQuota != nil
+	if hasDelta == hasAbsolute {
+		return newAPIError(http.StatusBadRequest, "invalid_request", "exactly one of delta_quota or absolute_quota is required")
+	}
+	if hasAbsolute {
+		return validateQuota(*request.AbsoluteQuota)
+	}
+	return validateQuotaDelta(*request.DeltaQuota)
+}
+
+func quotaAdjustmentResponse(username string, quotaBefore, quotaAfter, delta int, orderNo, reason string, replayed bool) gin.H {
+	return gin.H{
+		"username":     username,
+		"quota_before": quotaBefore,
+		"quota_after":  quotaAfter,
+		"delta_quota":  delta,
+		"order_no":     orderNo,
+		"reason":       reason,
+		"replayed":     replayed,
+	}
+}
+
 func loadQuotaOperation(tx *gorm.DB, tenantKey, targetType, targetRef string, request quotaAdjustmentRequest) (*QuotaOperation, bool, error) {
 	var existing QuotaOperation
 	err := tx.Where(
 		"tenant_key = ? AND target_type = ? AND target_ref = ? AND operation_id = ?",
-		tenantKey, targetType, targetRef, request.OperationID,
+		tenantKey, targetType, targetRef, request.OrderNo,
 	).First(&existing).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, false, nil
@@ -633,30 +921,38 @@ func loadQuotaOperation(tx *gorm.DB, tenantKey, targetType, targetRef string, re
 	if err != nil {
 		return nil, false, err
 	}
-	if existing.Delta != request.Delta || existing.Reason != strings.TrimSpace(request.Reason) {
-		return nil, false, newAPIError(http.StatusConflict, "operation_conflict", "operation_id was already used with a different adjustment")
+	if existing.Reason != strings.TrimSpace(request.Reason) {
+		return nil, false, newAPIError(http.StatusConflict, "operation_conflict", "order_no was already used with a different adjustment")
+	}
+	if request.AbsoluteQuota != nil {
+		if existing.AbsoluteQuota == nil || *existing.AbsoluteQuota != *request.AbsoluteQuota {
+			return nil, false, newAPIError(http.StatusConflict, "operation_conflict", "order_no was already used with a different adjustment")
+		}
+	} else if existing.AbsoluteQuota != nil || existing.Delta != *request.DeltaQuota {
+		return nil, false, newAPIError(http.StatusConflict, "operation_conflict", "order_no was already used with a different adjustment")
 	}
 	return &existing, true, nil
 }
 
-func createQuotaOperation(tx *gorm.DB, tenantKey, targetType, targetRef string, request quotaAdjustmentRequest, resultQuota int) error {
+func createQuotaOperation(tx *gorm.DB, tenantKey, targetType, targetRef string, request quotaAdjustmentRequest, delta, resultQuota int) error {
 	op := QuotaOperation{
-		TenantKey:   tenantKey,
-		TargetType:  targetType,
-		TargetRef:   targetRef,
-		OperationID: request.OperationID,
-		Delta:       request.Delta,
-		Reason:      strings.TrimSpace(request.Reason),
-		ResultQuota: resultQuota,
-		CreatedAt:   time.Now().Unix(),
+		TenantKey:     tenantKey,
+		TargetType:    targetType,
+		TargetRef:     targetRef,
+		OrderNo:       request.OrderNo,
+		Delta:         delta,
+		AbsoluteQuota: request.AbsoluteQuota,
+		Reason:        strings.TrimSpace(request.Reason),
+		ResultQuota:   resultQuota,
+		CreatedAt:     time.Now().Unix(),
 	}
 	if err := tx.Create(&op).Error; err != nil {
-		return newAPIError(http.StatusConflict, "operation_conflict", "operation_id was already used")
+		return newAPIError(http.StatusConflict, "operation_conflict", "order_no was already used")
 	}
 	return nil
 }
 
-func validOperationID(value string) bool {
+func validOrderNo(value string) bool {
 	if len(value) == 0 || len(value) > 128 {
 		return false
 	}
@@ -681,20 +977,119 @@ func pagination(c *gin.Context) (int, int, error) {
 	return page, pageSize, nil
 }
 
-func toTenantResponse(tenant Tenant, quota int) tenantResponse {
-	return tenantResponse{TenantKey: tenant.TenantKey, DisplayName: tenant.DisplayName, Status: tenant.Status, UserID: tenant.UserID, Quota: quota, CreatedAt: tenant.CreatedAt, UpdatedAt: tenant.UpdatedAt}
-}
-
-func toTokenResponse(token model.Token, secret string, visible bool) tokenResponse {
-	return tokenResponse{Name: token.Name, Token: secret, MaskedToken: model.MaskTokenKey(token.Key), Status: token.Status, RemainQuota: token.RemainQuota, UnlimitedQuota: token.UnlimitedQuota, CreatedAt: token.CreatedTime, SecretVisible: visible}
-}
-
-func truncateString(value string, maximum int) string {
-	runes := []rune(value)
-	if len(runes) <= maximum {
-		return value
+func primaryTokenName(tenantKey string) string {
+	name := "nova-" + tenantKey
+	if len(name) > 50 {
+		name = name[:50]
 	}
-	return string(runes[:maximum])
+	return name
+}
+
+func loadPrimaryToken(tx *gorm.DB, userID int, tenantKey string) (model.Token, error) {
+	var token model.Token
+	name := primaryTokenName(tenantKey)
+	err := tx.Where("user_id = ? AND name = ? AND status = ?", userID, name, common.TokenStatusEnabled).First(&token).Error
+	if err == nil {
+		return token, nil
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return model.Token{}, err
+	}
+	err = tx.Where("user_id = ? AND status = ?", userID, common.TokenStatusEnabled).Order("id DESC").First(&token).Error
+	if err == nil {
+		return token, nil
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return model.Token{}, err
+	}
+	err = tx.Where("user_id = ? AND name = ?", userID, name).First(&token).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return model.Token{}, newAPIError(http.StatusNotFound, "token_not_found", "token not found")
+	}
+	if err != nil {
+		return model.Token{}, err
+	}
+	return token, nil
+}
+
+func buildTenantDetail(tenant Tenant, user model.User) (tenantResponse, error) {
+	_, db := currentState()
+	lastActive := user.LastLoginAt
+	var lastUsage int64
+	if err := db.Model(&UsageEvent{}).Select("COALESCE(MAX(occurred_at), 0)").Where("tenant_id = ?", tenant.ID).Scan(&lastUsage).Error; err != nil {
+		return tenantResponse{}, err
+	}
+	if lastUsage > lastActive {
+		lastActive = lastUsage
+	}
+	if lastActive <= 0 {
+		lastActive = tenant.CreatedAt
+	}
+
+	tokenName := ""
+	tokenKey := ""
+	var token model.Token
+	err := db.Where("user_id = ? AND status = ?", tenant.UserID, common.TokenStatusEnabled).Order("id DESC").First(&token).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		err = db.Where("user_id = ?", tenant.UserID).Order("id DESC").First(&token).Error
+	}
+	if err == nil {
+		tokenName = token.Name
+		if token.Key != "" {
+			tokenKey = "sk-" + model.MaskTokenKey(token.Key)
+		}
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return tenantResponse{}, err
+	}
+
+	return tenantResponse{
+		UserID:       tenant.UserID,
+		Username:     user.Username,
+		DisplayName:  user.DisplayName,
+		Status:       tenantStatusFromUser(user),
+		Quota:        user.Quota,
+		UsedQuota:    user.UsedQuota,
+		TokenName:    tokenName,
+		TokenKey:     tokenKey,
+		CreatedAt:    formatUnixUTC(tenant.CreatedAt),
+		LastActiveAt: formatUnixUTC(lastActive),
+	}, nil
+}
+
+func formatUnixUTC(seconds int64) string {
+	if seconds <= 0 {
+		return ""
+	}
+	return time.Unix(seconds, 0).UTC().Format(time.RFC3339)
+}
+
+func toTenantKeyItem(token model.Token) tenantKeyItem {
+	return tenantKeyItem{
+		TokenID:        token.Id,
+		TokenName:      token.Name,
+		Key:            "sk-" + token.Key,
+		Status:         tokenStatusString(token.Status),
+		ExpiredTime:    token.ExpiredTime,
+		RemainQuota:    token.RemainQuota,
+		UnlimitedQuota: token.UnlimitedQuota,
+		UsedQuota:      token.UsedQuota,
+		CreatedTime:    token.CreatedTime,
+	}
+}
+
+func tokenStatusString(status int) string {
+	switch status {
+	case common.TokenStatusEnabled:
+		return "enabled"
+	case common.TokenStatusDisabled:
+		return "disabled"
+	case common.TokenStatusExpired:
+		return "expired"
+	case common.TokenStatusExhausted:
+		return "exhausted"
+	default:
+		return "disabled"
+	}
 }
 
 func writeIdempotentResponse(c *gin.Context, response idempotentResponse, err error) {
@@ -708,6 +1103,14 @@ func writeIdempotentResponse(c *gin.Context, response idempotentResponse, err er
 		c.Header("Idempotency-Replayed", "true")
 	}
 	c.Data(response.Status, "application/json; charset=utf-8", response.Body)
+}
+
+func successBody(data any) gin.H {
+	return gin.H{"success": true, "message": "ok", "data": data}
+}
+
+func successListBody(data any, page, pageSize int, total int64) gin.H {
+	return gin.H{"success": true, "message": "ok", "data": data, "page": page, "page_size": pageSize, "total": total}
 }
 
 func writeAPIError(c *gin.Context, err error) {

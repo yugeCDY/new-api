@@ -44,7 +44,7 @@ NOVA_HMAC_KEYS=current:<base64url-secret>
 NOVA_TENANT_KEY=<tenant-key>
 NOVA_TOKEN=<sk-token>
 NOVA_TEST_MODEL=deepseek-v3
-RABBITMQ_URL=amqp://user:password@127.0.0.1:5672/`
+NOVA_RABBITMQ_URL=amqp://user:password@127.0.0.1:5672/`
 
 export function NovaEnvironmentSetup() {
   const { t } = useTranslation(NOVA_TEST_NS)
@@ -94,6 +94,9 @@ export function NovaEnvironmentSetup() {
           <FieldDescription>
             {t(
               'Bash export, PowerShell $env:, and plain KEY=value formats are supported. Secrets are not saved.'
+            )}{' '}
+            {t(
+              'NOVA_BASE_URL must be the New-API origin such as http://127.0.0.1:3000, not the Vite page on :5173.'
             )}
           </FieldDescription>
         </Field>

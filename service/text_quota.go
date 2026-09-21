@@ -457,10 +457,11 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
 		model.UpdateChannelUsedQuota(relayInfo.ChannelId, summary.Quota)
 	}
 
+	settled := false
 	if err := SettleBilling(ctx, relayInfo, summary.Quota); err != nil {
 		logger.LogError(ctx, "error settling billing: "+err.Error())
 	} else {
-		RecordRelayFinalizedUsage(ctx, relayInfo, summary.Quota, summary.PromptTokens, summary.CompletionTokens)
+		settled = true
 	}
 
 	logModel := summary.ModelName
@@ -549,5 +550,8 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
 		Group:            relayInfo.UsingGroup,
 		Other:            other,
 	})
+	if settled {
+		RecordRelayFinalizedUsage(ctx, relayInfo, summary.Quota, summary.PromptTokens, summary.CompletionTokens)
+	}
 	relayInfo.PerformanceOutputTokens = int64(summary.CompletionTokens)
 }

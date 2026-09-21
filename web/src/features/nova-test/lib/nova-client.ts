@@ -205,7 +205,9 @@ export async function createNovaSignature(
   return {
     canonical,
     headers: {
-      'X-Nova-Key-Id': config.keyId.trim(),
+      ...(config.keyId.trim()
+        ? { 'X-Nova-Key-Id': config.keyId.trim() }
+        : {}),
       'X-Nova-Timestamp': timestamp,
       'X-Nova-Nonce': nonce,
       'X-Nova-Signature': bytesToHex(signature),
@@ -276,9 +278,6 @@ export async function executeNovaRequest(
     }
     if (spec.novaRequestId) {
       requestHeaders['X-Nova-Request-Id'] = spec.novaRequestId
-    }
-    if (spec.idempotencyKey) {
-      requestHeaders['Idempotency-Key'] = spec.idempotencyKey
     }
 
     const controller = new AbortController()

@@ -23,18 +23,18 @@ func recordAttribution(event service.UsageLifecycleEvent) error {
 	if !config.Enabled || db == nil {
 		return nil
 	}
-	tenant, err := resolveTenantOwnership(db, event.UserID, event.TokenID)
+	tenant, username, err := resolveTenantOwnership(db, event.UserID, event.TokenID)
 	if err != nil {
 		return err
 	}
-	if tenant.TenantKey != event.Attribution.Subject {
+	if username != event.Attribution.Subject {
 		return errors.New("verified usage attribution does not match token ownership")
 	}
 	return db.Clauses(clause.OnConflict{DoNothing: true}).Create(&Attribution{
 		SourceType:    event.SourceType,
 		SourceKey:     event.SourceKey,
 		TenantID:      tenant.ID,
-		TenantKey:     tenant.TenantKey,
+		TenantKey:     username,
 		UserID:        event.UserID,
 		TokenID:       event.TokenID,
 		NovaRequestID: event.Attribution.RequestID,
@@ -50,7 +50,7 @@ func recordFinalizedUsage(event service.UsageLifecycleEvent) error {
 	if !config.Enabled || db == nil {
 		return nil
 	}
-	tenant, err := resolveTenantOwnership(db, event.UserID, event.TokenID)
+	tenant, username, err := resolveTenantOwnership(db, event.UserID, event.TokenID)
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil
 	}
@@ -72,7 +72,7 @@ func recordFinalizedUsage(event service.UsageLifecycleEvent) error {
 		}
 		novaRequestID = attribution.NovaRequestID
 	} else {
-		if event.Attribution == nil || !event.Attribution.Verified || event.Attribution.Provider != "nova" || event.Attribution.Subject != tenant.TenantKey {
+		if event.Attribution == nil || !event.Attribution.Verified || event.Attribution.Provider != "nova" || event.Attribution.Subject != username {
 			return nil
 		}
 		novaRequestID = event.Attribution.RequestID
@@ -88,7 +88,7 @@ func recordFinalizedUsage(event service.UsageLifecycleEvent) error {
 		SourceType:       event.SourceType,
 		SourceKey:        event.SourceKey,
 		TenantID:         tenant.ID,
-		TenantKey:        tenant.TenantKey,
+		TenantKey:        username,
 		UserID:           event.UserID,
 		TokenID:          event.TokenID,
 		TokenName:        event.TokenName,
@@ -171,17 +171,24 @@ func marshalUsageMessage(event UsageEvent) ([]byte, error) {
 	})
 }
 
-func resolveTenantOwnership(db *gorm.DB, userID, tokenID int) (*Tenant, error) {
+func resolveTenantOwnership(db *gorm.DB, userID, tokenID int) (*Tenant, string, error) {
 	if userID <= 0 || tokenID <= 0 {
-		return nil, gorm.ErrRecordNotFound
+		return nil, "", gorm.ErrRecordNotFound
 	}
 	var token model.Token
 	if err := db.Select("id", "user_id").Where("id = ? AND user_id = ?", tokenID, userID).First(&token).Error; err != nil {
-		return nil, err
+		return nil, "", err
+	}
+	var user model.User
+	if err := db.Select("id", "username", "status", "deleted_at").First(&user, userID).Error; err != nil {
+		return nil, "", err
+	}
+	if user.DeletedAt.Valid || user.Status != common.UserStatusEnabled {
+		return nil, "", gorm.ErrRecordNotFound
 	}
 	var tenant Tenant
-	if err := db.Where("user_id = ? AND status = ?", userID, tenantStatusEnabled).First(&tenant).Error; err != nil {
-		return nil, err
+	if err := db.Where("user_id = ?", userID).First(&tenant).Error; err != nil {
+		return nil, "", err
 	}
-	return &tenant, nil
+	return &tenant, user.Username, nil
 }

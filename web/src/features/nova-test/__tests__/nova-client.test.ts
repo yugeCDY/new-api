@@ -107,6 +107,22 @@ describe('Nova request signing', () => {
     expect(signed.canonical).toContain('\na=a&a=z&b=2\n1700000000\n')
   })
 
+  it('omits X-Nova-Key-Id when the key ID field is empty', async () => {
+    const signed = await createNovaSignature(
+      { ...config, keyId: '' },
+      {
+        label: 'Health check',
+        method: 'GET',
+        path: '/api/novapay/health',
+        body: '',
+      }
+    )
+
+    expect(signed.headers['X-Nova-Key-Id']).toBeUndefined()
+    expect(signed.headers['X-Nova-Timestamp']).toBeTruthy()
+    expect(signed.headers['X-Nova-Signature']).toMatch(/^[0-9a-f]{64}$/)
+  })
+
   it('sends editable header overrides while redacting authorization in results', async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response('{"success":true}', {

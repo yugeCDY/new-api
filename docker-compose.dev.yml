@@ -33,9 +33,10 @@ services:
       - BATCH_UPDATE_ENABLED=true
       # Local HTTP dev mode: keep Secure=false and leave TRUSTED_URL unset. This disables the refresh/logout OriginGuard so the :5173 -> :3000 dev proxy works.
       - SESSION_COOKIE_SECURE=false
-      - NOVA_INTEGRATION_ENABLED=${NOVA_INTEGRATION_ENABLED:-false}
-      - NOVA_HMAC_KEYS=${NOVA_HMAC_KEYS:-}
-      - NOVA_RABBITMQ_URL=${NOVA_RABBITMQ_URL:-amqp://nova_dev:nova_dev_only@rabbitmq:5672/}
+      - SESSION_SECRET=4252043561c8047cbc471e8fba11786f9fda454a1b350ca8a89321f1edf6ac4c
+      - NOVA_INTEGRATION_ENABLED=true
+      - NOVA_HMAC_KEYS=current:I-66qs2nySY-TOMGme6pD3to1nUEViopwRZ8fQzwLhk
+      - NOVA_RABBITMQ_URL=amqp://nova_dev:nova_dev_only@rabbitmq:5672
       - CRITICAL_RATE_LIMIT_ENABLE=false
       # For HTTPS only: set Secure=true and list every exact trusted HTTPS browser Origin. This does not configure relay CORS.
       # - SESSION_COOKIE_SECURE=true

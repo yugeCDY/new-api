@@ -44,7 +44,7 @@ import type { NovaRequestResult, NovaTestConfig, RabbitMessage } from './types'
 
 const novaTestConfigSchema = z.object({
   baseUrl: z.url('Enter a valid New-API URL'),
-  keyId: z.string().trim().min(1, 'HMAC key ID is required'),
+  keyId: z.string(),
   hmacSecret: z.string().trim().min(1, 'HMAC secret is required'),
   tenantKey: z.string().trim().min(1, 'Required'),
   apiToken: z.string().trim().min(1, 'Required'),
@@ -62,7 +62,7 @@ const novaTestConfigSchema = z.object({
 
 const DEFAULT_CONFIG: NovaTestConfig = {
   baseUrl: 'http://127.0.0.1:3000',
-  keyId: 'current',
+  keyId: '',
   hmacSecret: '',
   tenantKey: '',
   apiToken: '',
@@ -119,7 +119,7 @@ export function NovaTest() {
                   </h1>
                   <p className='text-muted-foreground mt-2 text-sm leading-6'>
                     {t(
-                      'Expand any endpoint to inspect and edit its URL, parameters, headers, and body, then view the complete signed request and response.'
+                      'Edit the request headers and body above, then read the response below.'
                     )}
                   </p>
                 </div>

@@ -1,9 +1,11 @@
 package nova
 
 import (
+	"context"
 	"net/http"
 	"time"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/gin-gonic/gin"
 )
@@ -39,52 +41,87 @@ func RegisterRoutes(apiRouter *gin.RouterGroup) {
 
 func health(c *gin.Context) {
 	_, db := currentState()
+	redisEnabled := common.RedisEnabled
+	redisOK := !redisEnabled || redisConnected()
 	if db == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{
 			"success": false,
-			"status":  "unavailable",
+			"message": "database is unavailable",
+			"data": gin.H{
+				"status":   "down",
+				"database": gin.H{"connected": false},
+				"redis":    gin.H{"enabled": redisEnabled, "connected": redisOK && redisEnabled},
+				"mq":       gin.H{"connected": false, "outbox_pending": 0, "outbox_dead": 0},
+			},
 		})
 		return
 	}
 
-	var pending int64
-	var dead int64
-	var oldestPendingAt int64
-	var unresolvedAttributions int64
-	var oldestAttributionAt int64
+	var pending, dead int64
 	databaseOK := db.Raw("SELECT 1").Error == nil
 	if databaseOK {
-		databaseOK = db.Model(&Outbox{}).Where("status = ?", "pending").Count(&pending).Error == nil &&
-			db.Model(&Outbox{}).Where("status = ?", "dead").Count(&dead).Error == nil &&
-			db.Model(&Outbox{}).Where("status IN ?", []string{"pending", "publishing"}).Select("COALESCE(MIN(created_at), 0)").Scan(&oldestPendingAt).Error == nil &&
-			db.Model(&Attribution{}).Count(&unresolvedAttributions).Error == nil &&
-			db.Model(&Attribution{}).Select("COALESCE(MIN(created_at), 0)").Scan(&oldestAttributionAt).Error == nil
+		if err := db.Model(&Outbox{}).Where("status = ?", "pending").Count(&pending).Error; err != nil {
+			databaseOK = false
+			pending = 0
+		}
 	}
-	status := "ok"
-	httpStatus := http.StatusOK
-	if !databaseOK {
-		status = "unavailable"
-		httpStatus = http.StatusServiceUnavailable
+	if databaseOK {
+		if err := db.Model(&Outbox{}).Where("status = ?", "dead").Count(&dead).Error; err != nil {
+			databaseOK = false
+			dead = 0
+		}
 	}
+
 	mqConfigured, mqConnected := publisherHealth()
-	healthy := databaseOK && mqConfigured && mqConnected
-	if databaseOK && !healthy {
+	mqOK := mqConfigured && mqConnected
+	// Nova requires the main DB and RabbitMQ. Redis is host middleware used by
+	// token/quota paths; only degrade when it is enabled but unreachable.
+	healthy := databaseOK && mqOK && redisOK
+	status := "up"
+	httpStatus := http.StatusOK
+	message := "ok"
+	if !databaseOK {
+		status = "down"
+		httpStatus = http.StatusServiceUnavailable
+		message = "database is unavailable"
+	} else if !healthy {
 		status = "degraded"
 		httpStatus = http.StatusServiceUnavailable
+		switch {
+		case !mqOK:
+			message = "rabbitmq is unavailable"
+		case !redisOK:
+			message = "redis is unavailable"
+		default:
+			message = "service is degraded"
+		}
 	}
 	c.JSON(httpStatus, gin.H{
 		"success": healthy,
-		"status":  status,
-		"components": gin.H{
-			"database": gin.H{"ok": databaseOK},
-			"outbox": gin.H{
-				"pending":           pending,
-				"dead":              dead,
-				"oldest_pending_at": oldestPendingAt,
+		"message": message,
+		"data": gin.H{
+			"status": status,
+			"database": gin.H{
+				"connected": databaseOK,
 			},
-			"usage_candidates": gin.H{"unresolved": unresolvedAttributions, "oldest_created_at": oldestAttributionAt},
-			"rabbitmq":         gin.H{"configured": mqConfigured, "connected": mqConnected},
+			"redis": gin.H{
+				"enabled":   redisEnabled,
+				"connected": redisEnabled && redisOK,
+			},
+			"mq": gin.H{
+				"connected":      mqOK,
+				"outbox_pending": pending,
+				"outbox_dead":    dead,
+			},
 		},
-		"timestamp": time.Now().UTC().Format(time.RFC3339),
 	})
+}
+
+func redisConnected() bool {
+	if !common.RedisEnabled || common.RDB == nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	return common.RDB.Ping(ctx).Err() == nil
 }

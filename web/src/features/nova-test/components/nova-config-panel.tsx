@@ -149,6 +149,9 @@ export function NovaConfigPanel() {
               name='keyId'
               label={t('HMAC key ID')}
               placeholder='current'
+              description={t(
+                'Optional. Leave empty to use the server current key.'
+              )}
             />
             <ConfigField
               name='hmacSecret'

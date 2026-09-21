@@ -148,16 +148,16 @@ func testNovaMigrationContract(t *testing.T, db *gorm.DB) {
 	}
 
 	now := time.Now().Unix()
-	tenant := Tenant{TenantKey: "matrix-tenant", UserID: 1001, DisplayName: "Matrix", Status: tenantStatusEnabled, CreatedAt: now, UpdatedAt: now}
+	tenant := Tenant{UserID: 1001, CreatedAt: now, UpdatedAt: now}
 	require.NoError(t, db.Create(&tenant).Error)
-	duplicateTenant := Tenant{TenantKey: tenant.TenantKey, UserID: 1002, Status: tenantStatusEnabled, CreatedAt: now, UpdatedAt: now}
+	duplicateTenant := Tenant{UserID: 1001, CreatedAt: now, UpdatedAt: now}
 	assert.Error(t, db.Create(&duplicateTenant).Error)
 
 	nonce := ReplayNonce{KeyID: "current", NonceHash: strings.Repeat("a", 64), RequestTimestamp: now, ExpiresAt: now + 600, CreatedAt: now}
 	require.NoError(t, db.Create(&nonce).Error)
 	assert.Error(t, db.Create(&ReplayNonce{KeyID: nonce.KeyID, NonceHash: nonce.NonceHash, RequestTimestamp: now, ExpiresAt: now + 600, CreatedAt: now}).Error)
 
-	usage := UsageEvent{EventID: "matrix-event", SourceType: "relay", SourceKey: "matrix-request", TenantID: tenant.ID, TenantKey: tenant.TenantKey, CreatedAt: now}
+	usage := UsageEvent{EventID: "matrix-event", SourceType: "relay", SourceKey: "matrix-request", TenantID: tenant.ID, TenantKey: "matrix-tenant", CreatedAt: now}
 	require.NoError(t, db.Create(&usage).Error)
 	duplicateUsage := usage
 	duplicateUsage.ID = 0
@@ -170,13 +170,13 @@ func testNovaMigrationContract(t *testing.T, db *gorm.DB) {
 	assert.EqualValues(t, 1, reconciledOutboxCount)
 
 	quotaOp := QuotaOperation{
-		TenantKey: tenant.TenantKey, TargetType: quotaTargetTenant, TargetRef: "",
-		OperationID: "op-unique-1", Delta: 10, Reason: "test", ResultQuota: 10, CreatedAt: now,
+		TenantKey: "matrix-tenant", TargetType: quotaTargetTenant, TargetRef: "",
+		OrderNo: "op-unique-1", Delta: 10, Reason: "test", ResultQuota: 10, CreatedAt: now,
 	}
 	require.NoError(t, db.Create(&quotaOp).Error)
 	assert.Error(t, db.Create(&QuotaOperation{
-		TenantKey: tenant.TenantKey, TargetType: quotaTargetTenant, TargetRef: "",
-		OperationID: "op-unique-1", Delta: 20, Reason: "dup", ResultQuota: 30, CreatedAt: now,
+		TenantKey: "matrix-tenant", TargetType: quotaTargetTenant, TargetRef: "",
+		OrderNo: "op-unique-1", Delta: 20, Reason: "dup", ResultQuota: 30, CreatedAt: now,
 	}).Error)
 
 	if db.Migrator().HasTable(&model.User{}) {
@@ -239,6 +239,152 @@ func TestRegisterRoutesExposesContractOnlyWhenEnabled(t *testing.T) {
 	assert.Empty(t, disabledRouter.Routes())
 }
 
+func TestHealthReportsMiddlewareStatus(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := openTestDatabase(t)
+	require.NoError(t, migrate(db))
+	secret := bytes.Repeat([]byte{0x44}, 32)
+	setTestRuntime(t, db, secret)
+	previousRedisEnabled := common.RedisEnabled
+	common.RedisEnabled = false
+	t.Cleanup(func() { common.RedisEnabled = previousRedisEnabled })
+
+	now := time.Now().Unix()
+	require.NoError(t, db.Create(&Outbox{
+		EventID: "health-pending-1", ExchangeName: "nova.events", RoutingKey: "nova.usage.reported",
+		Payload: "{}", Status: "pending", NextAttemptAt: now, CreatedAt: now, UpdatedAt: now,
+	}).Error)
+	require.NoError(t, db.Create(&Outbox{
+		EventID: "health-dead-1", ExchangeName: "nova.events", RoutingKey: "nova.usage.reported",
+		Payload: "{}", Status: "dead", NextAttemptAt: now, CreatedAt: now, UpdatedAt: now,
+	}).Error)
+
+	router := gin.New()
+	RegisterRoutes(router.Group("/api"))
+	request := signedRequest(t, secret, http.MethodGet, "/api/novapay/health", strconvUnix(time.Now()), "healthmiddlewarestatus1", nil, nil)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	require.Equal(t, http.StatusServiceUnavailable, response.Code)
+
+	var body map[string]any
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &body))
+	assert.Equal(t, false, body["success"])
+	data := body["data"].(map[string]any)
+	assert.Equal(t, "degraded", data["status"])
+	assert.Equal(t, true, data["database"].(map[string]any)["connected"])
+	redis := data["redis"].(map[string]any)
+	assert.Equal(t, false, redis["enabled"])
+	assert.Equal(t, false, redis["connected"])
+	mq := data["mq"].(map[string]any)
+	assert.Equal(t, false, mq["connected"])
+	assert.EqualValues(t, 1, mq["outbox_pending"])
+	assert.EqualValues(t, 1, mq["outbox_dead"])
+}
+
+func TestModelCatalogReturnsAvailabilityAndPricing(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := openTestDatabase(t)
+	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}))
+	require.NoError(t, migrate(db))
+	secret := bytes.Repeat([]byte{0x45}, 32)
+	setTestRuntime(t, db, secret)
+	previousDB := model.DB
+	model.DB = db
+	model.InvalidatePricingCache()
+	t.Cleanup(func() {
+		model.DB = previousDB
+		model.InvalidatePricingCache()
+	})
+
+	require.NoError(t, db.Create(&model.Ability{Group: "default", Model: "demo-b", ChannelId: 4, Enabled: true}).Error)
+	require.NoError(t, db.Create(&model.Ability{Group: "default", Model: "demo-a", ChannelId: 1, Enabled: true}).Error)
+	require.NoError(t, db.Create(&model.Ability{Group: "vip", Model: "demo-a", ChannelId: 1, Enabled: true}).Error)
+	require.NoError(t, db.Create(&model.Ability{Group: "default", Model: "demo-a", ChannelId: 2, Enabled: true}).Error)
+	require.NoError(t, db.Create(&model.Ability{Group: "default", Model: "demo-a", ChannelId: 3, Enabled: false}).Error)
+
+	router := gin.New()
+	RegisterRoutes(router.Group("/api"))
+	request := signedRequest(t, secret, http.MethodGet, "/api/novapay/models", strconvUnix(time.Now()), "modelcatalognoncevalue1", nil, nil)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+
+	var body map[string]any
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &body))
+	assert.Equal(t, true, body["success"])
+	items := body["data"].(map[string]any)["items"].([]any)
+	require.Len(t, items, 2)
+	first := items[0].(map[string]any)
+	second := items[1].(map[string]any)
+	assert.Equal(t, "demo-a", first["model_name"])
+	assert.EqualValues(t, 2, first["channel_count"])
+	assert.Equal(t, true, first["enabled"])
+	assert.Equal(t, float64(0), first["quota_type"])
+	groups := first["enable_groups"].([]any)
+	assert.ElementsMatch(t, []any{"default", "vip"}, groups)
+	assert.Equal(t, "demo-b", second["model_name"])
+	assert.EqualValues(t, 1, second["channel_count"])
+	assert.Equal(t, true, second["enabled"])
+}
+
+func TestListTenantsKeepsOrphanWhenUserIsGone(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := openTestDatabase(t)
+	require.NoError(t, db.AutoMigrate(&model.User{}))
+	require.NoError(t, migrate(db))
+	secret := bytes.Repeat([]byte{0x46}, 32)
+	setTestRuntime(t, db, secret)
+
+	now := time.Now().Unix()
+	user := model.User{Username: "nova-list-user", Password: "unused", DisplayName: "ok", Status: common.UserStatusEnabled, Quota: 42, UsedQuota: 7, LastLoginAt: now - 50, Group: "default", AffCode: "nova-list-aff"}
+	require.NoError(t, db.Create(&user).Error)
+	okTenant := Tenant{UserID: user.Id, CreatedAt: now, UpdatedAt: now}
+	require.NoError(t, db.Create(&okTenant).Error)
+	orphan := model.User{Username: "list-orphan", Password: "unused", DisplayName: "orphan", Status: common.UserStatusDisabled, Group: "default", AffCode: "nova-list-orph"}
+	require.NoError(t, db.Create(&orphan).Error)
+	require.NoError(t, db.Delete(&orphan).Error)
+	require.NoError(t, db.Create(&Tenant{UserID: orphan.Id, CreatedAt: now, UpdatedAt: now}).Error)
+	require.NoError(t, db.Create(&UsageEvent{EventID: "list-active-1", SourceType: "relay", SourceKey: "list-active-1", TenantID: okTenant.ID, TenantKey: user.Username, OccurredAt: now, CreatedAt: now}).Error)
+
+	router := gin.New()
+	RegisterRoutes(router.Group("/api"))
+	request := signedRequest(t, secret, http.MethodGet, "/api/novapay/tenants?page=1&page_size=20", strconvUnix(time.Now()), "listorphanntenantsnonce1", nil, nil)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+
+	var body map[string]any
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &body))
+	assert.Equal(t, true, body["success"])
+	data := body["data"].(map[string]any)
+	assert.EqualValues(t, 2, data["total"])
+	assert.EqualValues(t, 1, data["page"])
+	assert.EqualValues(t, 20, data["page_size"])
+	items := data["items"].([]any)
+	require.Len(t, items, 2)
+	byKey := map[string]map[string]any{}
+	for _, item := range items {
+		row := item.(map[string]any)
+		byKey[row["username"].(string)] = row
+	}
+	assert.Equal(t, "ok", byKey["nova-list-user"]["display_name"])
+	assert.EqualValues(t, 42, byKey["nova-list-user"]["quota"])
+	assert.EqualValues(t, 7, byKey["nova-list-user"]["used_quota"])
+	assert.EqualValues(t, now, byKey["nova-list-user"]["last_active_at"])
+	assert.Equal(t, "orphan", byKey["list-orphan"]["display_name"])
+	assert.Equal(t, tenantStatusDeleted, byKey["list-orphan"]["status"])
+
+	filtered := signedRequest(t, secret, http.MethodGet, "/api/novapay/tenants?page=1&page_size=20&keyword=orphan&status=deleted", strconvUnix(time.Now()), "listfiltertenantsnonce1", nil, nil)
+	filteredResponse := httptest.NewRecorder()
+	router.ServeHTTP(filteredResponse, filtered)
+	require.Equal(t, http.StatusOK, filteredResponse.Code, filteredResponse.Body.String())
+	var filteredBody map[string]any
+	require.NoError(t, common.Unmarshal(filteredResponse.Body.Bytes(), &filteredBody))
+	filteredItems := filteredBody["data"].(map[string]any)["items"].([]any)
+	require.Len(t, filteredItems, 1)
+	assert.Equal(t, "list-orphan", filteredItems[0].(map[string]any)["username"])
+}
+
 func TestHMACAuthenticationAndReplayProtection(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	db := openTestDatabase(t)
@@ -268,6 +414,27 @@ func TestHMACAuthenticationAndReplayProtection(t *testing.T) {
 	router.ServeHTTP(replayResponse, replay)
 	assert.Equal(t, http.StatusUnauthorized, replayResponse.Code)
 	assert.NotContains(t, replayResponse.Body.String(), "replay")
+}
+
+func TestHMACAuthenticationAllowsMissingKeyID(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := openTestDatabase(t)
+	require.NoError(t, migrate(db))
+	secret := bytes.Repeat([]byte{0x5a}, 32)
+	setTestRuntime(t, db, secret)
+
+	router := gin.New()
+	router.Use(HMACAuth())
+	router.POST("/api/novapay/test", func(c *gin.Context) {
+		assert.Equal(t, "current", c.GetString("nova_key_id"))
+		c.Status(http.StatusNoContent)
+	})
+
+	request := signedRequest(t, secret, http.MethodPost, "/api/novapay/test", strconvUnix(time.Now()), "missingkeyidnoncevalue1", nil, nil)
+	request.Header.Del(headerKeyID)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	assert.Equal(t, http.StatusNoContent, response.Code)
 }
 
 func TestCanonicalRequestGolden(t *testing.T) {
@@ -389,80 +556,144 @@ func TestTenantCreationReturnsSecretOnceAndQuotaIsIdempotent(t *testing.T) {
 	api := router.Group("/api")
 	RegisterRoutes(api)
 
-	createBody := []byte(`{"tenant_key":"tenant-a","display_name":"Tenant A","quota":1000,"token_name":"primary","token_quota":500}`)
+	createBody := []byte(`{"tenant_key":"tenant-a","tenant_name":"Tenant A","initial_quota":1000,"request_id":"create-tenant-a"}`)
 	create := signedRequest(t, secret, http.MethodPost, "/api/novapay/tenant", strconvUnix(time.Now()), "createtenantnoncevalue1", createBody, createBody)
-	create.Header.Set("Idempotency-Key", "create-tenant-a")
 	createResponse := httptest.NewRecorder()
 	router.ServeHTTP(createResponse, create)
 	require.Equal(t, http.StatusOK, createResponse.Code, createResponse.Body.String())
 	var created map[string]any
 	require.NoError(t, common.Unmarshal(createResponse.Body.Bytes(), &created))
-	createdToken := created["token"].(map[string]any)
-	tokenSecret := createdToken["token"].(string)
+	require.Equal(t, true, created["success"])
+	assert.Equal(t, "ok", created["message"])
+	createdData := created["data"].(map[string]any)
+	assert.Equal(t, "tenant-a", createdData["username"])
+	assert.Equal(t, "nova-tenant-a", createdData["token_name"])
+	assert.EqualValues(t, 1000, createdData["quota"])
+	tokenSecret := createdData["token_key"].(string)
 	assert.True(t, strings.HasPrefix(tokenSecret, "sk-"))
-	assert.True(t, createdToken["secret_visible"].(bool))
 
 	replay := signedRequest(t, secret, http.MethodPost, "/api/novapay/tenant", strconvUnix(time.Now()), "replaycreatenoncevalue1", createBody, createBody)
-	replay.Header.Set("Idempotency-Key", "create-tenant-a")
 	replayResponse := httptest.NewRecorder()
 	router.ServeHTTP(replayResponse, replay)
 	require.Equal(t, http.StatusOK, replayResponse.Code, replayResponse.Body.String())
 	assert.Equal(t, "true", replayResponse.Header().Get("Idempotency-Replayed"))
-	assert.NotContains(t, replayResponse.Body.String(), tokenSecret)
-	assert.NotContains(t, replayResponse.Body.String(), `"token":"sk-`)
+	var replayed map[string]any
+	require.NoError(t, common.Unmarshal(replayResponse.Body.Bytes(), &replayed))
+	assert.Equal(t, tokenSecret, replayed["data"].(map[string]any)["token_key"])
 
-	quotaBody := []byte(`{"operation_id":"credit-1","delta":250,"reason":"test credit"}`)
+	getTenantReq := signedRequest(t, secret, http.MethodGet, "/api/novapay/tenant/tenant-a", strconvUnix(time.Now()), "gettenantdetailnonce12", nil, nil)
+	getTenantResponse := httptest.NewRecorder()
+	router.ServeHTTP(getTenantResponse, getTenantReq)
+	require.Equal(t, http.StatusOK, getTenantResponse.Code, getTenantResponse.Body.String())
+	var detail map[string]any
+	require.NoError(t, common.Unmarshal(getTenantResponse.Body.Bytes(), &detail))
+	assert.Equal(t, "ok", detail["message"])
+	detailData := detail["data"].(map[string]any)
+	assert.Equal(t, "tenant-a", detailData["username"])
+	assert.Equal(t, "Tenant A", detailData["display_name"])
+	assert.Equal(t, tenantStatusEnabled, detailData["status"])
+	assert.EqualValues(t, 1000, detailData["quota"])
+	assert.EqualValues(t, 0, detailData["used_quota"])
+	assert.Equal(t, "nova-tenant-a", detailData["token_name"])
+	maskedKey, _ := detailData["token_key"].(string)
+	assert.True(t, strings.HasPrefix(maskedKey, "sk-"))
+	assert.NotEqual(t, tokenSecret, maskedKey)
+	assert.NotContains(t, maskedKey, strings.TrimPrefix(tokenSecret, "sk-"))
+	assert.Contains(t, detailData["created_at"].(string), "T")
+	assert.Contains(t, detailData["last_active_at"].(string), "T")
+	_, hasTenantKey := detailData["tenant_key"]
+	assert.False(t, hasTenantKey)
+
+	updateBody := []byte(`{"request_id":"update-tenant-a-name","display_name":"Tenant A Renamed"}`)
+	update := signedRequest(t, secret, http.MethodPut, "/api/novapay/tenant/tenant-a", strconvUnix(time.Now()), "updatetenantnoncevalue1", updateBody, updateBody)
+	updateResponse := httptest.NewRecorder()
+	router.ServeHTTP(updateResponse, update)
+	require.Equal(t, http.StatusOK, updateResponse.Code, updateResponse.Body.String())
+	var updated map[string]any
+	require.NoError(t, common.Unmarshal(updateResponse.Body.Bytes(), &updated))
+	assert.Equal(t, "Tenant A Renamed", updated["data"].(map[string]any)["display_name"])
+
+	var storedUser model.User
+	require.NoError(t, db.Select("id", "display_name").First(&storedUser, createdData["user_id"]).Error)
+	assert.Equal(t, "Tenant A Renamed", storedUser.DisplayName)
+
+	getAfterUpdate := signedRequest(t, secret, http.MethodGet, "/api/novapay/tenant/tenant-a", strconvUnix(time.Now()), "gettenantafterupdaten1", nil, nil)
+	getAfterUpdateResponse := httptest.NewRecorder()
+	router.ServeHTTP(getAfterUpdateResponse, getAfterUpdate)
+	require.Equal(t, http.StatusOK, getAfterUpdateResponse.Code, getAfterUpdateResponse.Body.String())
+	var afterUpdate map[string]any
+	require.NoError(t, common.Unmarshal(getAfterUpdateResponse.Body.Bytes(), &afterUpdate))
+	assert.Equal(t, "Tenant A Renamed", afterUpdate["data"].(map[string]any)["display_name"])
+
+	quotaBody := []byte(`{"request_id":"tenant-credit-1","order_no":"credit-1","delta_quota":250,"reason":"test credit"}`)
 	quota := signedRequest(t, secret, http.MethodPost, "/api/novapay/tenant/tenant-a/quota", strconvUnix(time.Now()), "tenantquotanoncevalue1", quotaBody, quotaBody)
-	quota.Header.Set("Idempotency-Key", "tenant-credit-1")
 	quotaResponse := httptest.NewRecorder()
 	router.ServeHTTP(quotaResponse, quota)
 	require.Equal(t, http.StatusOK, quotaResponse.Code, quotaResponse.Body.String())
+	assert.Contains(t, quotaResponse.Body.String(), `"message":"ok"`)
+	assert.Contains(t, quotaResponse.Body.String(), `"quota_before":1000`)
+	assert.Contains(t, quotaResponse.Body.String(), `"quota_after":1250`)
+	assert.Contains(t, quotaResponse.Body.String(), `"delta_quota":250`)
+	assert.Contains(t, quotaResponse.Body.String(), `"order_no":"credit-1"`)
 
 	quotaReplay := signedRequest(t, secret, http.MethodPost, "/api/novapay/tenant/tenant-a/quota", strconvUnix(time.Now()), "quotareplaynoncevalue1", quotaBody, quotaBody)
-	quotaReplay.Header.Set("Idempotency-Key", "tenant-credit-1")
 	quotaReplayResponse := httptest.NewRecorder()
 	router.ServeHTTP(quotaReplayResponse, quotaReplay)
 	require.Equal(t, http.StatusOK, quotaReplayResponse.Code, quotaReplayResponse.Body.String())
 	assert.Equal(t, "true", quotaReplayResponse.Header().Get("Idempotency-Replayed"))
 
-	conflictingQuotaBody := []byte(`{"operation_id":"credit-1","delta":251,"reason":"changed credit"}`)
+	conflictingQuotaBody := []byte(`{"request_id":"tenant-credit-1","order_no":"credit-1","delta_quota":251,"reason":"changed credit"}`)
 	conflictingQuota := signedRequest(t, secret, http.MethodPost, "/api/novapay/tenant/tenant-a/quota", strconvUnix(time.Now()), "quotaconflictnonceval1", conflictingQuotaBody, conflictingQuotaBody)
-	conflictingQuota.Header.Set("Idempotency-Key", "tenant-credit-1")
 	conflictingQuotaResponse := httptest.NewRecorder()
 	router.ServeHTTP(conflictingQuotaResponse, conflictingQuota)
 	assert.Equal(t, http.StatusConflict, conflictingQuotaResponse.Code)
 	assert.Contains(t, conflictingQuotaResponse.Body.String(), "idempotency_conflict")
 
-	// Same operation_id with a new Idempotency-Key must not double-apply (business unique).
-	quotaBizReplay := signedRequest(t, secret, http.MethodPost, "/api/novapay/tenant/tenant-a/quota", strconvUnix(time.Now()), "quotabizreplaynonceval1", quotaBody, quotaBody)
-	quotaBizReplay.Header.Set("Idempotency-Key", "tenant-credit-1-retry-key")
+	// Same order_no with a new request_id must not double-apply (business unique).
+	quotaBizReplayBody := []byte(`{"request_id":"tenant-credit-1-retry-key","order_no":"credit-1","delta_quota":250,"reason":"test credit"}`)
+	quotaBizReplay := signedRequest(t, secret, http.MethodPost, "/api/novapay/tenant/tenant-a/quota", strconvUnix(time.Now()), "quotabizreplaynonceval1", quotaBizReplayBody, quotaBizReplayBody)
 	quotaBizReplayResponse := httptest.NewRecorder()
 	router.ServeHTTP(quotaBizReplayResponse, quotaBizReplay)
 	require.Equal(t, http.StatusOK, quotaBizReplayResponse.Code, quotaBizReplayResponse.Body.String())
 	assert.Contains(t, quotaBizReplayResponse.Body.String(), `"replayed":true`)
 	assert.NotEqual(t, "true", quotaBizReplayResponse.Header().Get("Idempotency-Replayed"))
+	assert.Contains(t, quotaBizReplayResponse.Body.String(), `"quota_before":1000`)
+	assert.Contains(t, quotaBizReplayResponse.Body.String(), `"quota_after":1250`)
 
-	// Same operation_id + new Key + different delta → business conflict.
-	quotaOpConflict := signedRequest(t, secret, http.MethodPost, "/api/novapay/tenant/tenant-a/quota", strconvUnix(time.Now()), "quotaopconflictnonceval", conflictingQuotaBody, conflictingQuotaBody)
-	quotaOpConflict.Header.Set("Idempotency-Key", "tenant-credit-1-conflict-key")
+	// Same order_no + new request_id + different delta → business conflict.
+	quotaOpConflictBody := []byte(`{"request_id":"tenant-credit-1-conflict-key","order_no":"credit-1","delta_quota":251,"reason":"changed credit"}`)
+	quotaOpConflict := signedRequest(t, secret, http.MethodPost, "/api/novapay/tenant/tenant-a/quota", strconvUnix(time.Now()), "quotaopconflictnonceval", quotaOpConflictBody, quotaOpConflictBody)
 	quotaOpConflictResponse := httptest.NewRecorder()
 	router.ServeHTTP(quotaOpConflictResponse, quotaOpConflict)
 	assert.Equal(t, http.StatusConflict, quotaOpConflictResponse.Code)
 	assert.Contains(t, quotaOpConflictResponse.Body.String(), "operation_conflict")
 
+	absoluteQuotaBody := []byte(`{"request_id":"tenant-absolute-1","order_no":"absolute-1","absolute_quota":2000,"reason":"reconcile"}`)
+	absoluteQuota := signedRequest(t, secret, http.MethodPost, "/api/novapay/tenant/tenant-a/quota", strconvUnix(time.Now()), "tenantabsolutequota001", absoluteQuotaBody, absoluteQuotaBody)
+	absoluteQuotaResponse := httptest.NewRecorder()
+	router.ServeHTTP(absoluteQuotaResponse, absoluteQuota)
+	require.Equal(t, http.StatusOK, absoluteQuotaResponse.Code, absoluteQuotaResponse.Body.String())
+	assert.Contains(t, absoluteQuotaResponse.Body.String(), `"quota_before":1250`)
+	assert.Contains(t, absoluteQuotaResponse.Body.String(), `"quota_after":2000`)
+	assert.Contains(t, absoluteQuotaResponse.Body.String(), `"delta_quota":750`)
+
 	var user model.User
 	require.NoError(t, db.First(&user).Error)
-	assert.Equal(t, 1250, user.Quota)
+	assert.Equal(t, 2000, user.Quota)
 
 	list := signedRequest(t, secret, http.MethodGet, "/api/novapay/tenant/tenant-a/tokens", strconvUnix(time.Now()), "listtokensnoncevalue12", nil, nil)
 	listResponse := httptest.NewRecorder()
 	router.ServeHTTP(listResponse, list)
 	require.Equal(t, http.StatusOK, listResponse.Code, listResponse.Body.String())
-	assert.NotContains(t, listResponse.Body.String(), tokenSecret)
-	assert.Contains(t, listResponse.Body.String(), "masked_token")
+	assert.Contains(t, listResponse.Body.String(), `"token_name":"nova-tenant-a"`)
+	assert.Contains(t, listResponse.Body.String(), `"key":"sk-`)
+	assert.Contains(t, listResponse.Body.String(), `"status":"enabled"`)
+	assert.Contains(t, listResponse.Body.String(), `"items"`)
+	assert.Contains(t, listResponse.Body.String(), `"message":"ok"`)
+	assert.Contains(t, listResponse.Body.String(), tokenSecret)
 
-	disable := signedRequest(t, secret, http.MethodPost, "/api/novapay/tenant/tenant-a/disable", strconvUnix(time.Now()), "disabletenantnoncevalue", nil, nil)
-	disable.Header.Set("Idempotency-Key", "disable-tenant-a")
+	disableBody := []byte(`{"request_id":"disable-tenant-a"}`)
+	disable := signedRequest(t, secret, http.MethodPost, "/api/novapay/tenant/tenant-a/disable", strconvUnix(time.Now()), "disabletenantnoncevalue", disableBody, disableBody)
 	disableResponse := httptest.NewRecorder()
 	router.ServeHTTP(disableResponse, disable)
 	require.Equal(t, http.StatusOK, disableResponse.Code, disableResponse.Body.String())
@@ -470,65 +701,75 @@ func TestTenantCreationReturnsSecretOnceAndQuotaIsIdempotent(t *testing.T) {
 	require.NoError(t, db.Model(&model.Token{}).Where("user_id = ? AND status = ?", user.Id, common.TokenStatusEnabled).Count(&enabledTokens).Error)
 	assert.Zero(t, enabledTokens)
 
-	enable := signedRequest(t, secret, http.MethodPost, "/api/novapay/tenant/tenant-a/enable", strconvUnix(time.Now()), "enabletenantnoncevalue1", nil, nil)
-	enable.Header.Set("Idempotency-Key", "enable-tenant-a")
+	enableBody := []byte(`{"request_id":"enable-tenant-a"}`)
+	enable := signedRequest(t, secret, http.MethodPost, "/api/novapay/tenant/tenant-a/enable", strconvUnix(time.Now()), "enabletenantnoncevalue1", enableBody, enableBody)
 	enableResponse := httptest.NewRecorder()
 	router.ServeHTTP(enableResponse, enable)
 	require.Equal(t, http.StatusOK, enableResponse.Code, enableResponse.Body.String())
 	require.NoError(t, db.Model(&model.Token{}).Where("user_id = ? AND status = ?", user.Id, common.TokenStatusEnabled).Count(&enabledTokens).Error)
 	assert.Zero(t, enabledTokens, "enabling a tenant must not reactivate individually disabled tokens")
 
-	rotateBody := []byte(`{"old_token_name":"primary","new_token_name":"rotated","token_quota":400}`)
+	rotateBody := []byte(`{"request_id":"rotate-primary-token","reason":"suspected leak"}`)
 	rotate := signedRequest(t, secret, http.MethodPost, "/api/novapay/tenant/tenant-a/token/rotate", strconvUnix(time.Now()), "rotatetokennoncevalue1", rotateBody, rotateBody)
-	rotate.Header.Set("Idempotency-Key", "rotate-primary-token")
 	rotateResponse := httptest.NewRecorder()
 	router.ServeHTTP(rotateResponse, rotate)
 	require.Equal(t, http.StatusOK, rotateResponse.Code, rotateResponse.Body.String())
-	assert.Contains(t, rotateResponse.Body.String(), `"secret_visible":true`)
-	assert.Contains(t, rotateResponse.Body.String(), `"token":"sk-`)
+	assert.Contains(t, rotateResponse.Body.String(), `"old_token_name":"nova-tenant-a"`)
+	assert.Contains(t, rotateResponse.Body.String(), `"token_name":"nova-tenant-a"`)
+	assert.Contains(t, rotateResponse.Body.String(), `"token_key":"sk-`)
+	assert.Contains(t, rotateResponse.Body.String(), `"message":"ok"`)
+	var rotatePayload map[string]any
+	require.NoError(t, common.Unmarshal(rotateResponse.Body.Bytes(), &rotatePayload))
+	rotatedSecret := rotatePayload["data"].(map[string]any)["token_key"].(string)
+	assert.NotEqual(t, tokenSecret, rotatedSecret)
 
 	rotateReplay := signedRequest(t, secret, http.MethodPost, "/api/novapay/tenant/tenant-a/token/rotate", strconvUnix(time.Now()), "rotatereplaynoncevalue1", rotateBody, rotateBody)
-	rotateReplay.Header.Set("Idempotency-Key", "rotate-primary-token")
 	rotateReplayResponse := httptest.NewRecorder()
 	router.ServeHTTP(rotateReplayResponse, rotateReplay)
 	require.Equal(t, http.StatusOK, rotateReplayResponse.Code, rotateReplayResponse.Body.String())
-	assert.NotContains(t, rotateReplayResponse.Body.String(), `"token":"sk-`)
-	assert.Contains(t, rotateReplayResponse.Body.String(), `"secret_visible":false`)
+	assert.Equal(t, "true", rotateReplayResponse.Header().Get("Idempotency-Replayed"))
+	assert.Contains(t, rotateReplayResponse.Body.String(), rotatedSecret)
 
-	tokenQuotaBody := []byte(`{"operation_id":"token-credit-1","delta":25,"reason":"test"}`)
-	tokenQuota := signedRequest(t, secret, http.MethodPost, "/api/novapay/tenant/tenant-a/tokens/rotated/quota", strconvUnix(time.Now()), "tokenquotanoncevalue12", tokenQuotaBody, tokenQuotaBody)
-	tokenQuota.Header.Set("Idempotency-Key", "token-credit-rotated")
+	tokenQuotaBody := []byte(`{"request_id":"token-set-quota-1","remain_quota":500000,"unlimited_quota":false,"reason":"employee quota"}`)
+	tokenQuota := signedRequest(t, secret, http.MethodPost, "/api/novapay/tenant/tenant-a/tokens/nova-tenant-a/quota", strconvUnix(time.Now()), "tokenquotanoncevalue12", tokenQuotaBody, tokenQuotaBody)
 	tokenQuotaResponse := httptest.NewRecorder()
 	router.ServeHTTP(tokenQuotaResponse, tokenQuota)
 	require.Equal(t, http.StatusOK, tokenQuotaResponse.Code, tokenQuotaResponse.Body.String())
-	assert.Contains(t, tokenQuotaResponse.Body.String(), `"remain_quota":425`)
+	assert.Contains(t, tokenQuotaResponse.Body.String(), `"token_name":"nova-tenant-a"`)
+	assert.Contains(t, tokenQuotaResponse.Body.String(), `"remain_quota":500000`)
+	assert.Contains(t, tokenQuotaResponse.Body.String(), `"unlimited_quota":false`)
 
-	tokenQuotaBizReplay := signedRequest(t, secret, http.MethodPost, "/api/novapay/tenant/tenant-a/tokens/rotated/quota", strconvUnix(time.Now()), "tokenquotabizreplayn12", tokenQuotaBody, tokenQuotaBody)
-	tokenQuotaBizReplay.Header.Set("Idempotency-Key", "token-credit-rotated-new-key")
-	tokenQuotaBizReplayResponse := httptest.NewRecorder()
-	router.ServeHTTP(tokenQuotaBizReplayResponse, tokenQuotaBizReplay)
-	require.Equal(t, http.StatusOK, tokenQuotaBizReplayResponse.Code, tokenQuotaBizReplayResponse.Body.String())
-	assert.Contains(t, tokenQuotaBizReplayResponse.Body.String(), `"replayed":true`)
-	assert.Contains(t, tokenQuotaBizReplayResponse.Body.String(), `"remain_quota":425`)
+	tokenQuotaReplay := signedRequest(t, secret, http.MethodPost, "/api/novapay/tenant/tenant-a/tokens/nova-tenant-a/quota", strconvUnix(time.Now()), "tokenquotareplaynonce1", tokenQuotaBody, tokenQuotaBody)
+	tokenQuotaReplayResponse := httptest.NewRecorder()
+	router.ServeHTTP(tokenQuotaReplayResponse, tokenQuotaReplay)
+	require.Equal(t, http.StatusOK, tokenQuotaReplayResponse.Code, tokenQuotaReplayResponse.Body.String())
+	assert.Equal(t, "true", tokenQuotaReplayResponse.Header().Get("Idempotency-Replayed"))
+	assert.Contains(t, tokenQuotaReplayResponse.Body.String(), `"remain_quota":500000`)
 
-	deleteTokenRequest := signedRequest(t, secret, http.MethodDelete, "/api/novapay/tenant/tenant-a/tokens/rotated", strconvUnix(time.Now()), "deletetokennoncevalue1", nil, nil)
-	deleteTokenRequest.Header.Set("Idempotency-Key", "delete-rotated-token")
+	var rotatedToken model.Token
+	require.NoError(t, db.Where("user_id = ? AND name = ?", user.Id, "nova-tenant-a").First(&rotatedToken).Error)
+	assert.Equal(t, 500000, rotatedToken.RemainQuota)
+	assert.False(t, rotatedToken.UnlimitedQuota)
+
+	deleteTokenBody := []byte(`{"request_id":"delete-rotated-token"}`)
+	deleteTokenRequest := signedRequest(t, secret, http.MethodDelete, "/api/novapay/tenant/tenant-a/tokens/nova-tenant-a", strconvUnix(time.Now()), "deletetokennoncevalue1", deleteTokenBody, deleteTokenBody)
 	deleteTokenResponse := httptest.NewRecorder()
 	router.ServeHTTP(deleteTokenResponse, deleteTokenRequest)
 	require.Equal(t, http.StatusOK, deleteTokenResponse.Code, deleteTokenResponse.Body.String())
 
-	deleteTenantRequest := signedRequest(t, secret, http.MethodDelete, "/api/novapay/tenant/tenant-a", strconvUnix(time.Now()), "deletetenantnoncevalue", nil, nil)
-	deleteTenantRequest.Header.Set("Idempotency-Key", "delete-tenant-a")
+	deleteTenantBody := []byte(`{"request_id":"delete-tenant-a"}`)
+	deleteTenantRequest := signedRequest(t, secret, http.MethodDelete, "/api/novapay/tenant/tenant-a", strconvUnix(time.Now()), "deletetenantnoncevalue", deleteTenantBody, deleteTenantBody)
 	deleteTenantResponse := httptest.NewRecorder()
 	router.ServeHTTP(deleteTenantResponse, deleteTenantRequest)
 	require.Equal(t, http.StatusOK, deleteTenantResponse.Code, deleteTenantResponse.Body.String())
 
-	reenableDeleted := signedRequest(t, secret, http.MethodPost, "/api/novapay/tenant/tenant-a/enable", strconvUnix(time.Now()), "reenabledeletednoncevalue", nil, nil)
-	reenableDeleted.Header.Set("Idempotency-Key", "reenable-deleted-tenant")
+	reenableDeletedBody := []byte(`{"request_id":"reenable-deleted-tenant"}`)
+	reenableDeleted := signedRequest(t, secret, http.MethodPost, "/api/novapay/tenant/tenant-a/enable", strconvUnix(time.Now()), "reenabledeletednoncevalue", reenableDeletedBody, reenableDeletedBody)
 	reenableDeletedResponse := httptest.NewRecorder()
 	router.ServeHTTP(reenableDeletedResponse, reenableDeleted)
 	assert.Equal(t, http.StatusConflict, reenableDeletedResponse.Code)
 	assert.Contains(t, reenableDeletedResponse.Body.String(), "tenant_deleted")
+	assert.Contains(t, reenableDeletedResponse.Body.String(), `"message":`)
 }
 
 func TestRelayAttributionRejectsTenantMismatch(t *testing.T) {
@@ -545,7 +786,7 @@ func TestRelayAttributionRejectsTenantMismatch(t *testing.T) {
 	require.NoError(t, db.Create(&user).Error)
 	token := model.Token{UserId: user.Id, Key: "relay-token-key", Name: "primary", Status: common.TokenStatusEnabled, RemainQuota: 1000}
 	require.NoError(t, db.Create(&token).Error)
-	require.NoError(t, db.Create(&Tenant{TenantKey: "relay-tenant", UserID: user.Id, DisplayName: "Relay", Status: tenantStatusEnabled, CreatedAt: time.Now().Unix(), UpdatedAt: time.Now().Unix()}).Error)
+	require.NoError(t, db.Create(&Tenant{UserID: user.Id, CreatedAt: time.Now().Unix(), UpdatedAt: time.Now().Unix()}).Error)
 
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
@@ -571,7 +812,7 @@ func TestRelayAttributionRejectsTenantMismatch(t *testing.T) {
 
 	valid := signedRequest(t, secret, http.MethodPost, "/v1/chat/completions", strconvUnix(time.Now()), "validtenantnoncevalue1", body, body)
 	valid.Header.Set("X-Test-Request-Id", "gateway-request-1")
-	valid.Header.Set("X-Nova-Tenant-Key", "relay-tenant")
+	valid.Header.Set("X-Nova-Tenant-Key", "nova-relay-user")
 	validResponse := httptest.NewRecorder()
 	router.ServeHTTP(validResponse, valid)
 	assert.Equal(t, http.StatusNoContent, validResponse.Code)
@@ -588,7 +829,7 @@ func TestRelayAttributionRejectsTenantMismatch(t *testing.T) {
 	}, RelayAttribution())
 	failureRouter.POST("/v1/chat/completions", func(c *gin.Context) { c.Status(http.StatusBadGateway) })
 	failure := signedRequest(t, secret, http.MethodPost, "/v1/chat/completions", strconvUnix(time.Now()), "failedrelaynoncevalue12", body, body)
-	failure.Header.Set("X-Nova-Tenant-Key", "relay-tenant")
+	failure.Header.Set("X-Nova-Tenant-Key", "nova-relay-user")
 	failureResponse := httptest.NewRecorder()
 	failureRouter.ServeHTTP(failureResponse, failure)
 	assert.Equal(t, http.StatusBadGateway, failureResponse.Code)
@@ -607,7 +848,7 @@ func TestFinalizedUsageCreatesOneLedgerAndOutboxRecord(t *testing.T) {
 	require.NoError(t, db.Create(&user).Error)
 	token := model.Token{UserId: user.Id, Key: "ledger-token-key", Name: "primary", Status: common.TokenStatusEnabled, RemainQuota: 1000}
 	require.NoError(t, db.Create(&token).Error)
-	tenant := Tenant{TenantKey: "ledger-tenant", UserID: user.Id, DisplayName: "Ledger", Status: tenantStatusEnabled, CreatedAt: time.Now().Unix(), UpdatedAt: time.Now().Unix()}
+	tenant := Tenant{UserID: user.Id, CreatedAt: time.Now().Unix(), UpdatedAt: time.Now().Unix()}
 	require.NoError(t, db.Create(&tenant).Error)
 
 	event := service.UsageLifecycleEvent{
@@ -622,7 +863,7 @@ func TestFinalizedUsageCreatesOneLedgerAndOutboxRecord(t *testing.T) {
 		PromptTokens:     10,
 		CompletionTokens: 5,
 		TotalTokens:      15,
-		Attribution:      &service.UsageAttribution{Provider: "nova", Subject: tenant.TenantKey, RequestID: "nova-request-1", Verified: true},
+		Attribution:      &service.UsageAttribution{Provider: "nova", Subject: user.Username, RequestID: "nova-request-1", Verified: true},
 	}
 	require.NoError(t, recordFinalizedUsage(event))
 	require.NoError(t, recordFinalizedUsage(event))
@@ -634,10 +875,18 @@ func TestFinalizedUsageCreatesOneLedgerAndOutboxRecord(t *testing.T) {
 	assert.EqualValues(t, 1, eventCount)
 	assert.EqualValues(t, 1, outboxCount)
 
+	var stored UsageEvent
+	require.NoError(t, db.First(&stored).Error)
+	assert.Equal(t, event.SourceKey, stored.SourceKey)
+	assert.Equal(t, 42, stored.Quota)
+	assert.Equal(t, 10, stored.PromptTokens)
+	assert.Equal(t, 5, stored.CompletionTokens)
+
 	var outbox Outbox
 	require.NoError(t, db.First(&outbox).Error)
 	assert.Equal(t, "pending", outbox.Status)
 	assert.Contains(t, outbox.Payload, `"event_type":"nova.usage.reported"`)
+	assert.NotContains(t, outbox.Payload, `"usage_payload"`)
 	assert.NotContains(t, outbox.Payload, token.Key)
 	require.NoError(t, db.Delete(&outbox).Error)
 	require.NoError(t, reconcileMissingOutbox(db, Config{Exchange: "nova.events", RoutingKey: "nova.usage.reported", BatchSize: 10}, time.Now()))
@@ -664,9 +913,9 @@ func TestGenericTaskObserverRecordsOnlyFinalSuccess(t *testing.T) {
 	require.NoError(t, db.Create(&user).Error)
 	token := model.Token{UserId: user.Id, Key: "task-token-key", Name: "primary", Status: common.TokenStatusEnabled, RemainQuota: 1000}
 	require.NoError(t, db.Create(&token).Error)
-	tenant := Tenant{TenantKey: "task-tenant", UserID: user.Id, DisplayName: "Task", Status: tenantStatusEnabled, CreatedAt: time.Now().Unix(), UpdatedAt: time.Now().Unix()}
+	tenant := Tenant{UserID: user.Id, CreatedAt: time.Now().Unix(), UpdatedAt: time.Now().Unix()}
 	require.NoError(t, db.Create(&tenant).Error)
-	require.NoError(t, db.Create(&Attribution{SourceType: "task", SourceKey: "task-success", TenantID: tenant.ID, TenantKey: tenant.TenantKey, UserID: user.Id, TokenID: token.Id, NovaRequestID: "nova-task-request", CreatedAt: time.Now().Unix()}).Error)
+	require.NoError(t, db.Create(&Attribution{SourceType: "task", SourceKey: "task-success", TenantID: tenant.ID, TenantKey: user.Username, UserID: user.Id, TokenID: token.Id, NovaRequestID: "nova-task-request", CreatedAt: time.Now().Unix()}).Error)
 
 	task := &model.Task{TaskID: "task-success", UserId: user.Id, Status: model.TaskStatusSuccess, Quota: 77, Group: "default"}
 	task.PrivateData.TokenId = token.Id
@@ -857,15 +1106,15 @@ func TestNonNovaAndFailedRelayDoNotCreateUsageEvents(t *testing.T) {
 		Quota: 9, Attribution: &service.UsageAttribution{Provider: "nova", Subject: "missing-tenant", Verified: true},
 	}))
 
-	tenant := Tenant{TenantKey: "negative-tenant", UserID: user.Id, DisplayName: "Negative", Status: tenantStatusEnabled, CreatedAt: time.Now().Unix(), UpdatedAt: time.Now().Unix()}
+	tenant := Tenant{UserID: user.Id, CreatedAt: time.Now().Unix(), UpdatedAt: time.Now().Unix()}
 	require.NoError(t, db.Create(&tenant).Error)
 	require.NoError(t, recordFinalizedUsage(service.UsageLifecycleEvent{
 		SourceType: "relay", SourceKey: "unverified-request", UserID: user.Id, TokenID: token.Id,
-		Quota: 11, Attribution: &service.UsageAttribution{Provider: "nova", Subject: tenant.TenantKey, Verified: false},
+		Quota: 11, Attribution: &service.UsageAttribution{Provider: "nova", Subject: user.Username, Verified: false},
 	}))
 	require.EqualError(t, recordFinalizedUsage(service.UsageLifecycleEvent{
 		SourceType: "relay", SourceKey: "negative-quota", UserID: user.Id, TokenID: token.Id, Quota: -1,
-		Attribution: &service.UsageAttribution{Provider: "nova", Subject: tenant.TenantKey, Verified: true},
+		Attribution: &service.UsageAttribution{Provider: "nova", Subject: user.Username, Verified: true},
 	}), "invalid finalized usage event")
 
 	var eventCount int64

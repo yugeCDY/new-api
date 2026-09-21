@@ -24,7 +24,6 @@ import { useTranslation } from 'react-i18next'
 
 import { NOVA_TEST_NS } from '../i18n'
 
-import { CopyButton } from '@/components/copy-button'
 import { JsonCodeEditor } from '@/components/json-code-editor'
 import {
   AccordionContent,
@@ -36,10 +35,19 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Field, FieldDescription, FieldLabel } from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 
 import { executeNovaRequest } from '../lib/nova-client'
 import type { NovaEndpointTemplate } from '../lib/nova-endpoints'
 import type { NovaRequestResult, NovaTestConfig } from '../types'
+import { NovaResponsePane } from './nova-response-pane'
 
 type NovaEndpointCardProps = {
   endpoint: NovaEndpointTemplate
@@ -75,6 +83,35 @@ function endpointUrl(baseUrl: string, path: string): string {
   return `${baseUrl.trim().replace(/\/$/, '')}${path.startsWith('/') ? path : `/${path}`}`
 }
 
+const TENANT_STATUS_OPTIONS = [
+  { value: 'all', labelKey: 'All statuses' },
+  { value: 'enabled', labelKey: 'Enabled' },
+  { value: 'disabled', labelKey: 'Disabled' },
+  { value: 'deleted', labelKey: 'Deleted' },
+] as const
+
+function readQueryParam(url: string, key: string): string {
+  try {
+    return new URL(url).searchParams.get(key) ?? ''
+  } catch {
+    return ''
+  }
+}
+
+function writeQueryParam(url: string, key: string, value: string): string {
+  try {
+    const parsed = new URL(url)
+    if (value) {
+      parsed.searchParams.set(key, value)
+    } else {
+      parsed.searchParams.delete(key)
+    }
+    return parsed.toString()
+  } catch {
+    return url
+  }
+}
+
 function captureOneTimeValues(
   endpointId: string,
   responseBody: string,
@@ -83,14 +120,26 @@ function captureOneTimeValues(
   if (!['create-tenant', 'rotate-token'].includes(endpointId)) return
   try {
     const response = JSON.parse(responseBody) as {
-      tenant?: { tenant_key?: unknown }
-      token?: { token?: unknown }
+        data?: {
+        username?: unknown
+        tenant_key?: unknown
+        token_key?: unknown
+        tenant?: { tenant_key?: unknown }
+        token?: { token?: unknown }
+      }
     }
-    if (typeof response.tenant?.tenant_key === 'string') {
-      form.setValue('tenantKey', response.tenant.tenant_key)
+    const data = response.data
+    if (typeof data?.username === 'string') {
+      form.setValue('tenantKey', data.username)
+    } else if (typeof data?.tenant_key === 'string') {
+      form.setValue('tenantKey', data.tenant_key)
+    } else if (typeof data?.tenant?.tenant_key === 'string') {
+      form.setValue('tenantKey', data.tenant.tenant_key)
     }
-    if (typeof response.token?.token === 'string') {
-      form.setValue('apiToken', response.token.token)
+    if (typeof data?.token_key === 'string') {
+      form.setValue('apiToken', data.token_key)
+    } else if (typeof data?.token?.token === 'string') {
+      form.setValue('apiToken', data.token.token)
     }
   } catch {
     // The raw response remains visible for diagnostics.
@@ -108,6 +157,16 @@ export function NovaEndpointCard(props: NovaEndpointCardProps) {
   const [isRunning, setIsRunning] = useState(false)
   const displayedUrl =
     urlOverride || endpointUrl(props.baseUrl, props.endpoint.path)
+  const tenantStatusFilter =
+    props.endpoint.id === 'tenants'
+      ? readQueryParam(displayedUrl, 'status') || 'all'
+      : 'all'
+
+  const setTenantStatusFilter = (nextStatus: string | null) => {
+    if (!nextStatus) return
+    const queryValue = nextStatus === 'all' ? '' : nextStatus
+    setUrlOverride(writeQueryParam(displayedUrl, 'status', queryValue))
+  }
 
   const run = async () => {
     setError('')
@@ -117,10 +176,11 @@ export function NovaEndpointCard(props: NovaEndpointCardProps) {
       const runId = globalThis.crypto.randomUUID()
       const variables = {
         tenant_key: config.tenantKey,
+        token_name: `nova-${config.tenantKey}`,
         api_token: config.apiToken,
         model: config.model,
-        idempotency_key: `nova-test-${runId}`,
-        operation_id: `nova-test-${runId}`,
+        request_id: `nova-test-${runId}`,
+        order_no: `nova-test-${runId}`,
         nova_request_id: `nova-test-${runId}`,
       }
       let target: URL
@@ -156,26 +216,10 @@ export function NovaEndpointCard(props: NovaEndpointCardProps) {
     }
   }
 
-  const resultDetail = result
-    ? JSON.stringify(
-        {
-          request: {
-            method: result.method,
-            url: result.url,
-            headers: result.requestHeaders,
-            canonical: result.canonical,
-            body: result.requestBody || undefined,
-          },
-          response: {
-            status: result.status,
-            headers: result.responseHeaders,
-            body: result.responseBody,
-            error: result.error,
-          },
-        },
-        null,
-        2
-      )
+  const sentHeaders = result
+    ? Object.entries(result.requestHeaders)
+        .map(([key, value]) => `${key}: ${value}`)
+        .join('\n')
     : ''
 
   return (
@@ -212,50 +256,60 @@ export function NovaEndpointCard(props: NovaEndpointCardProps) {
         <p className='text-muted-foreground text-sm'>
           {t(props.endpoint.descriptionKey)}
         </p>
-        <Field>
-          <FieldLabel htmlFor={`nova-url-${props.endpoint.id}`}>
-            {t('Request URL and query parameters')}
-          </FieldLabel>
-          <Input
-            id={`nova-url-${props.endpoint.id}`}
-            value={displayedUrl}
-            onChange={(event) => setUrlOverride(event.target.value)}
-            className='font-mono text-xs'
-            spellCheck={false}
-          />
-          <FieldDescription>
-            {t('Template variables are replaced when the request is sent.')}
-          </FieldDescription>
-        </Field>
-
-        <div className='grid gap-4 xl:grid-cols-2'>
-          <Field>
-            <FieldLabel>{t('Request headers')}</FieldLabel>
-            <JsonCodeEditor
-              value={headers}
-              onChange={setHeaders}
-              heightClassName='h-52 min-h-52 max-h-52'
-              ariaLabel={t('Request headers')}
-            />
+        {props.endpoint.id === 'tenants' ? (
+          <Field className='max-w-xs'>
+            <FieldLabel htmlFor={`nova-status-${props.endpoint.id}`}>
+              {t('Status filter')}
+            </FieldLabel>
+            <Select
+              items={TENANT_STATUS_OPTIONS.map((option) => ({
+                value: option.value,
+                label: t(option.labelKey),
+              }))}
+              value={tenantStatusFilter}
+              onValueChange={setTenantStatusFilter}
+            >
+              <SelectTrigger
+                id={`nova-status-${props.endpoint.id}`}
+                aria-label={t('Status filter')}
+                className='w-full'
+              >
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent alignItemWithTrigger={false}>
+                {TENANT_STATUS_OPTIONS.map((option) => (
+                  <SelectItem key={option.value} value={option.value}>
+                    {t(option.labelKey)}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
             <FieldDescription>
-              {t(
-                'HMAC signature headers are generated automatically and can be overridden here for negative tests.'
-              )}
+              {t('Filters tenants by enabled, disabled, or deleted.')}
             </FieldDescription>
           </Field>
-          <Field>
-            <FieldLabel>{t('Request body')}</FieldLabel>
-            <JsonCodeEditor
-              value={body}
-              onChange={setBody}
-              heightClassName='h-52 min-h-52 max-h-52'
-              placeholder=''
-              ariaLabel={t('Request body')}
-            />
+        ) : null}
+        <div className='flex flex-col gap-2 sm:flex-row sm:items-end'>
+          <Field className='min-w-0 flex-1'>
+            <FieldLabel htmlFor={`nova-url-${props.endpoint.id}`}>
+              {t('Request URL and query parameters')}
+            </FieldLabel>
+            <div className='flex min-w-0 items-center gap-2'>
+              <Badge
+                variant='outline'
+                className='h-8 min-w-14 shrink-0 justify-center font-mono text-[11px]'
+              >
+                {props.endpoint.method}
+              </Badge>
+              <Input
+                id={`nova-url-${props.endpoint.id}`}
+                value={displayedUrl}
+                onChange={(event) => setUrlOverride(event.target.value)}
+                className='font-mono text-xs'
+                spellCheck={false}
+              />
+            </div>
           </Field>
-        </div>
-
-        <div className='flex flex-wrap items-center gap-2'>
           <Button type='button' onClick={() => void run()} disabled={isRunning}>
             {isRunning ? (
               <Loader2
@@ -266,12 +320,66 @@ export function NovaEndpointCard(props: NovaEndpointCardProps) {
             ) : (
               <Play data-icon='inline-start' aria-hidden='true' />
             )}
-            {isRunning ? t('Sending...') : t('Send this request')}
+            {isRunning ? t('Sending...') : t('Send')}
           </Button>
-          <span className='text-muted-foreground text-xs'>
-            {'{{tenant_key}} · {{api_token}} · {{model}} · {{idempotency_key}}'}
-          </span>
         </div>
+        <p className='text-muted-foreground text-xs'>
+          {t(
+            'Request placeholders are filled from the connection form when you send. Environment variables only fill that form first.'
+          )}
+        </p>
+        <p className='text-muted-foreground font-mono text-[11px]'>
+          {'{{tenant_key}} ← NOVA_TENANT_KEY · {{model}} ← NOVA_TEST_MODEL · {{api_token}} ← NOVA_TOKEN · {{request_id}} ← auto'}
+        </p>
+
+        <section aria-label={t('Request')} className='overflow-hidden rounded-lg border'>
+          <div className='bg-muted/40 border-b px-3 py-2 text-sm font-medium'>
+            {t('Request')}
+          </div>
+          <Tabs defaultValue='headers'>
+            <TabsList variant='line' className='h-9 px-2'>
+              <TabsTrigger value='headers'>{t('Headers')}</TabsTrigger>
+              <TabsTrigger value='body'>{t('Body')}</TabsTrigger>
+              <TabsTrigger value='signature'>{t('Signature')}</TabsTrigger>
+            </TabsList>
+            <TabsContent value='headers' className='space-y-2 p-3'>
+              <JsonCodeEditor
+                value={headers}
+                onChange={setHeaders}
+                heightClassName='h-52 min-h-52 max-h-52'
+                ariaLabel={t('Request headers')}
+              />
+              <FieldDescription>
+                {t(
+                  'HMAC signature headers are generated automatically and can be overridden here for negative tests.'
+                )}
+              </FieldDescription>
+            </TabsContent>
+            <TabsContent value='body' className='p-3'>
+              <JsonCodeEditor
+                value={body}
+                onChange={setBody}
+                heightClassName='h-52 min-h-52 max-h-52'
+                placeholder=''
+                ariaLabel={t('Request body')}
+              />
+            </TabsContent>
+            <TabsContent value='signature' className='space-y-3 p-3'>
+              <pre className='max-h-40 overflow-auto font-mono text-xs break-all whitespace-pre-wrap'>
+                {result?.canonical ||
+                  t('The signature is generated when the request is sent.')}
+              </pre>
+              {sentHeaders ? (
+                <div>
+                  <p className='mb-1 text-xs font-medium'>{t('Sent headers')}</p>
+                  <pre className='max-h-40 overflow-auto font-mono text-xs break-all whitespace-pre-wrap'>
+                    {sentHeaders}
+                  </pre>
+                </div>
+              ) : null}
+            </TabsContent>
+          </Tabs>
+        </section>
 
         {error ? (
           <Alert variant='destructive'>
@@ -281,26 +389,7 @@ export function NovaEndpointCard(props: NovaEndpointCardProps) {
           </Alert>
         ) : null}
 
-        {result ? (
-          <div className='relative overflow-hidden rounded-lg border'>
-            <div className='bg-muted/40 flex items-center gap-2 border-b px-3 py-2'>
-              {result.ok ? (
-                <CheckCircle2 className='size-4 text-emerald-600' />
-              ) : (
-                <CircleX className='text-destructive size-4' />
-              )}
-              <span className='font-medium'>{t('Request and response')}</span>
-              <span className='text-muted-foreground text-xs'>
-                HTTP {result.status ?? t('Network error')} · {result.durationMs}{' '}
-                ms
-              </span>
-              <CopyButton value={resultDetail} className='ml-auto' />
-            </div>
-            <pre className='max-h-[520px] overflow-auto p-3 font-mono text-xs break-all whitespace-pre-wrap'>
-              {resultDetail}
-            </pre>
-          </div>
-        ) : null}
+        <NovaResponsePane result={result} />
       </AccordionContent>
     </AccordionItem>
   )

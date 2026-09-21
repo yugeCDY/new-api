@@ -226,10 +226,11 @@ func PostWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, mod
 		model.UpdateChannelUsedQuota(relayInfo.ChannelId, quota)
 	}
 
+	settled := false
 	if err := SettleBilling(ctx, relayInfo, quota); err != nil {
 		logger.LogError(ctx, "error settling billing: "+err.Error())
 	} else {
-		RecordRelayFinalizedUsage(ctx, relayInfo, quota, usage.InputTokens, usage.OutputTokens)
+		settled = true
 	}
 
 	logModel := modelName
@@ -256,6 +257,9 @@ func PostWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, mod
 		Group:            relayInfo.UsingGroup,
 		Other:            other,
 	})
+	if settled {
+		RecordRelayFinalizedUsage(ctx, relayInfo, quota, usage.InputTokens, usage.OutputTokens)
+	}
 }
 
 func CalcOpenRouterCacheCreateTokens(usage dto.Usage, priceData types.PriceData) int {
@@ -361,10 +365,11 @@ func PostAudioConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, u
 		model.UpdateChannelUsedQuota(relayInfo.ChannelId, quota)
 	}
 
+	settled := false
 	if err := SettleBilling(ctx, relayInfo, quota); err != nil {
 		logger.LogError(ctx, "error settling billing: "+err.Error())
 	} else {
-		RecordRelayFinalizedUsage(ctx, relayInfo, quota, usage.PromptTokens, usage.CompletionTokens)
+		settled = true
 	}
 
 	logModel := billingModelName
@@ -391,6 +396,9 @@ func PostAudioConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, u
 		Group:            relayInfo.UsingGroup,
 		Other:            other,
 	})
+	if settled {
+		RecordRelayFinalizedUsage(ctx, relayInfo, quota, usage.PromptTokens, usage.CompletionTokens)
+	}
 	relayInfo.PerformanceOutputTokens = int64(usage.CompletionTokens)
 }
 

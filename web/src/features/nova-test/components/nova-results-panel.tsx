@@ -22,7 +22,6 @@ import { useTranslation } from 'react-i18next'
 
 import { NOVA_TEST_NS } from '../i18n'
 
-import { CopyButton } from '@/components/copy-button'
 import { Button } from '@/components/ui/button'
 import {
   Card,
@@ -31,9 +30,11 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { cn } from '@/lib/utils'
 
 import type { NovaRequestResult } from '../types'
+import { NovaResponsePane } from './nova-response-pane'
 
 type NovaResultsPanelProps = {
   results: NovaRequestResult[]
@@ -50,9 +51,7 @@ export function NovaResultsPanel(props: NovaResultsPanelProps) {
           <div>
             <CardTitle>{t('Request timeline')}</CardTitle>
             <CardDescription>
-              {t(
-                'Inspect canonical strings, redacted headers, and raw responses.'
-              )}
+              {t('Open a call to compare its request and response separately.')}
             </CardDescription>
           </div>
           {props.results.length ? (
@@ -71,25 +70,9 @@ export function NovaResultsPanel(props: NovaResultsPanelProps) {
         {props.results.length ? (
           <div className='space-y-2'>
             {props.results.map((result) => {
-              const detail = JSON.stringify(
-                {
-                  request: {
-                    method: result.method,
-                    url: result.url,
-                    headers: result.requestHeaders,
-                    canonical: result.canonical,
-                    body: result.requestBody || undefined,
-                  },
-                  response: {
-                    status: result.status,
-                    headers: result.responseHeaders,
-                    body: result.responseBody,
-                    error: result.error,
-                  },
-                },
-                null,
-                2
-              )
+              const requestHeaders = Object.entries(result.requestHeaders)
+                .map(([key, value]) => `${key}: ${value}`)
+                .join('\n')
               return (
                 <details
                   key={result.id}
@@ -126,14 +109,36 @@ export function NovaResultsPanel(props: NovaResultsPanelProps) {
                       {result.durationMs} ms
                     </span>
                   </summary>
-                  <div className='relative border-t'>
-                    <CopyButton
-                      value={detail}
-                      className='bg-background/80 absolute top-2 right-2 z-10'
-                    />
-                    <pre className='max-h-[480px] overflow-auto p-3 pr-12 font-mono text-xs break-all whitespace-pre-wrap'>
-                      {detail}
-                    </pre>
+                  <div className='space-y-3 border-t p-3'>
+                    <section aria-label={t('Request')} className='rounded-lg border'>
+                      <div className='bg-muted/40 border-b px-3 py-2 text-sm font-medium'>
+                        {t('Request')}
+                      </div>
+                      <Tabs defaultValue='headers'>
+                        <TabsList variant='line' className='h-9 px-2'>
+                          <TabsTrigger value='headers'>{t('Headers')}</TabsTrigger>
+                          <TabsTrigger value='body'>{t('Body')}</TabsTrigger>
+                          <TabsTrigger value='signature'>{t('Signature')}</TabsTrigger>
+                        </TabsList>
+                        <TabsContent value='headers'>
+                          <pre className='max-h-48 overflow-auto p-3 font-mono text-xs break-all whitespace-pre-wrap'>
+                            {requestHeaders || t('No request headers')}
+                          </pre>
+                        </TabsContent>
+                        <TabsContent value='body'>
+                          <pre className='max-h-48 overflow-auto p-3 font-mono text-xs break-all whitespace-pre-wrap'>
+                            {result.requestBody || t('No request body')}
+                          </pre>
+                        </TabsContent>
+                        <TabsContent value='signature'>
+                          <pre className='max-h-48 overflow-auto p-3 font-mono text-xs break-all whitespace-pre-wrap'>
+                            {result.canonical ||
+                              t('The signature is generated when the request is sent.')}
+                          </pre>
+                        </TabsContent>
+                      </Tabs>
+                    </section>
+                    <NovaResponsePane result={result} />
                   </div>
                 </details>
               )

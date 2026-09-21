@@ -72,6 +72,26 @@ describe('Nova endpoint workbench', () => {
     expect(screen.getByLabelText('Request headers')).toBeVisible()
   })
 
+  it('adds a status filter that updates the tenants request URL', async () => {
+    const user = userEvent.setup()
+    render(<Fixture />)
+
+    await user.click(screen.getByRole('button', { name: /List tenants/ }))
+    expect(screen.getByLabelText('Status filter')).toBeVisible()
+    expect(
+      screen.getByLabelText('Request URL and query parameters')
+    ).toHaveValue('http://127.0.0.1:3000/api/novapay/tenants?page=1&page_size=20')
+
+    await user.click(screen.getByLabelText('Status filter'))
+    await user.click(screen.getByRole('option', { name: 'Enabled' }))
+
+    expect(
+      screen.getByLabelText('Request URL and query parameters')
+    ).toHaveValue(
+      'http://127.0.0.1:3000/api/novapay/tenants?page=1&page_size=20&status=enabled'
+    )
+  })
+
   it('shows model usage as a separate editable request', async () => {
     const user = userEvent.setup()
     render(<Fixture />)
@@ -84,8 +104,11 @@ describe('Nova endpoint workbench', () => {
     expect(
       screen.getByLabelText('Request URL and query parameters')
     ).toHaveValue('http://127.0.0.1:3000/v1/chat/completions')
+    expect(screen.getByRole('button', { name: 'Send' })).toBeEnabled()
+    expect(screen.getByRole('region', { name: 'Request' })).toBeVisible()
+    expect(screen.getByRole('region', { name: 'Response' })).toBeVisible()
     expect(
-      screen.getByRole('button', { name: 'Send this request' })
-    ).toBeEnabled()
+      screen.getByText('Send a request to see the response here.')
+    ).toBeVisible()
   })
 })

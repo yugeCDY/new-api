@@ -33,7 +33,6 @@ const WRITE_HEADERS = JSON.stringify(
   {
     Accept: 'application/json',
     'Content-Type': 'application/json',
-    'Idempotency-Key': '{{idempotency_key}}',
   },
   null,
   2
@@ -65,7 +64,8 @@ export const NOVA_ENDPOINTS: NovaEndpointTemplate[] = [
   {
     id: 'tenants',
     labelKey: 'List tenants',
-    descriptionKey: 'Lists Nova tenants with editable pagination parameters.',
+    descriptionKey:
+      'Lists Nova tenants with pagination and an optional status filter.',
     method: 'GET',
     path: '/api/novapay/tenants?page=1&page_size=20',
     headers: JSON_HEADERS,
@@ -75,19 +75,17 @@ export const NOVA_ENDPOINTS: NovaEndpointTemplate[] = [
   {
     id: 'create-tenant',
     labelKey: 'Create tenant',
-    descriptionKey: 'Creates a tenant and returns its initial token once.',
+    descriptionKey:
+      'Creates a tenant account and returns token_key. Idempotent via request_id.',
     method: 'POST',
     path: '/api/novapay/tenant',
     headers: WRITE_HEADERS,
     body: JSON.stringify(
       {
         tenant_key: '{{tenant_key}}',
-        display_name: 'Nova Test Tenant',
-        quota: 1000000,
-        token_name: 'default',
-        token_quota: 1000000,
-        unlimited_quota: false,
-        metadata: { source: 'nova-test-page' },
+        tenant_name: 'Nova Test Tenant',
+        initial_quota: 1000000,
+        request_id: '{{request_id}}',
       },
       null,
       2
@@ -107,14 +105,14 @@ export const NOVA_ENDPOINTS: NovaEndpointTemplate[] = [
   {
     id: 'update-tenant',
     labelKey: 'Update tenant',
-    descriptionKey: 'Updates the tenant display name and metadata.',
+    descriptionKey: 'Updates the tenant display name.',
     method: 'PUT',
     path: '/api/novapay/tenant/{{tenant_key}}',
     headers: WRITE_HEADERS,
     body: JSON.stringify(
       {
+        request_id: '{{request_id}}',
         display_name: 'Nova Test Tenant Updated',
-        metadata: { source: 'nova-test-page', updated: true },
       },
       null,
       2
@@ -125,14 +123,15 @@ export const NOVA_ENDPOINTS: NovaEndpointTemplate[] = [
     id: 'tenant-quota',
     labelKey: 'Adjust tenant quota',
     descriptionKey:
-      'Adds or subtracts tenant quota with a unique operation ID.',
+      'Adds or subtracts tenant quota with a unique order number.',
     method: 'POST',
     path: '/api/novapay/tenant/{{tenant_key}}/quota',
     headers: WRITE_HEADERS,
     body: JSON.stringify(
       {
-        operation_id: '{{operation_id}}',
-        delta: 100,
+        request_id: '{{request_id}}',
+        order_no: '{{order_no}}',
+        delta_quota: 100,
         reason: 'nova-test-page',
       },
       null,
@@ -147,7 +146,7 @@ export const NOVA_ENDPOINTS: NovaEndpointTemplate[] = [
     method: 'POST',
     path: '/api/novapay/tenant/{{tenant_key}}/disable',
     headers: WRITE_HEADERS,
-    body: '',
+    body: JSON.stringify({ request_id: '{{request_id}}' }, null, 2),
     category: 'management',
   },
   {
@@ -158,22 +157,20 @@ export const NOVA_ENDPOINTS: NovaEndpointTemplate[] = [
     method: 'POST',
     path: '/api/novapay/tenant/{{tenant_key}}/enable',
     headers: WRITE_HEADERS,
-    body: '',
+    body: JSON.stringify({ request_id: '{{request_id}}' }, null, 2),
     category: 'management',
   },
   {
     id: 'rotate-token',
-    labelKey: 'Rotate tenant token',
-    descriptionKey: 'Creates a replacement token and disables the old token.',
+    labelKey: 'Rotate tenant key',
+    descriptionKey: 'Rotates the primary token secret; the old key stops working immediately.',
     method: 'POST',
     path: '/api/novapay/tenant/{{tenant_key}}/token/rotate',
     headers: WRITE_HEADERS,
     body: JSON.stringify(
       {
-        old_token_name: 'default',
-        new_token_name: 'rotated',
-        token_quota: 1000000,
-        unlimited_quota: false,
+        reason: 'suspected leak',
+        request_id: '{{request_id}}',
       },
       null,
       2
@@ -182,8 +179,8 @@ export const NOVA_ENDPOINTS: NovaEndpointTemplate[] = [
   },
   {
     id: 'list-tokens',
-    labelKey: 'List tenant tokens',
-    descriptionKey: 'Lists masked tokens and their current status and quota.',
+    labelKey: 'Query tenant keys',
+    descriptionKey: 'Lists tenant API keys including the full secret.',
     method: 'GET',
     path: '/api/novapay/tenant/{{tenant_key}}/tokens',
     headers: JSON_HEADERS,
@@ -192,16 +189,17 @@ export const NOVA_ENDPOINTS: NovaEndpointTemplate[] = [
   },
   {
     id: 'token-quota',
-    labelKey: 'Adjust token quota',
-    descriptionKey: 'Adds or subtracts quota for the token named in the URL.',
+    labelKey: 'Set token quota',
+    descriptionKey: 'Sets remain_quota and unlimited_quota for the token named in the URL.',
     method: 'POST',
-    path: '/api/novapay/tenant/{{tenant_key}}/tokens/default/quota',
+    path: '/api/novapay/tenant/{{tenant_key}}/tokens/{{token_name}}/quota',
     headers: WRITE_HEADERS,
     body: JSON.stringify(
       {
-        operation_id: '{{operation_id}}',
-        delta: 100,
-        reason: 'nova-test-page',
+        remain_quota: 500000,
+        unlimited_quota: false,
+        reason: 'employee quota',
+        request_id: '{{request_id}}',
       },
       null,
       2
@@ -213,9 +211,9 @@ export const NOVA_ENDPOINTS: NovaEndpointTemplate[] = [
     labelKey: 'Revoke token',
     descriptionKey: 'Disables the token named in the editable request URL.',
     method: 'DELETE',
-    path: '/api/novapay/tenant/{{tenant_key}}/tokens/default',
+    path: '/api/novapay/tenant/{{tenant_key}}/tokens/{{token_name}}',
     headers: WRITE_HEADERS,
-    body: '',
+    body: JSON.stringify({ request_id: '{{request_id}}' }, null, 2),
     category: 'management',
   },
   {
@@ -237,7 +235,7 @@ export const NOVA_ENDPOINTS: NovaEndpointTemplate[] = [
     method: 'DELETE',
     path: '/api/novapay/tenant/{{tenant_key}}',
     headers: WRITE_HEADERS,
-    body: '',
+    body: JSON.stringify({ request_id: '{{request_id}}' }, null, 2),
     category: 'management',
   },
   {

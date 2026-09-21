@@ -3,15 +3,10 @@ package nova
 import "gorm.io/gorm"
 
 type Tenant struct {
-	ID          int64          `json:"id"`
-	TenantKey   string         `json:"tenant_key" gorm:"type:varchar(64);uniqueIndex"`
-	UserID      int            `json:"user_id" gorm:"uniqueIndex"`
-	DisplayName string         `json:"display_name" gorm:"type:varchar(128)"`
-	Status      string         `json:"status" gorm:"type:varchar(16);index"`
-	Metadata    string         `json:"-" gorm:"type:text"`
-	CreatedAt   int64          `json:"created_at" gorm:"bigint"`
-	UpdatedAt   int64          `json:"updated_at" gorm:"bigint"`
-	DeletedAt   gorm.DeletedAt `json:"-" gorm:"index"`
+	ID        int64 `json:"id"`
+	UserID    int   `json:"user_id" gorm:"uniqueIndex"`
+	CreatedAt int64 `json:"created_at" gorm:"bigint"`
+	UpdatedAt int64 `json:"updated_at" gorm:"bigint"`
 }
 
 func (Tenant) TableName() string { return "nova_tenants" }
@@ -22,7 +17,7 @@ type UsageEvent struct {
 	SourceType       string `json:"source_type" gorm:"type:varchar(16);uniqueIndex:idx_nova_usage_source,priority:1"`
 	SourceKey        string `json:"source_key" gorm:"type:varchar(128);uniqueIndex:idx_nova_usage_source,priority:2"`
 	TenantID         int64  `json:"tenant_id" gorm:"uniqueIndex:idx_nova_usage_source,priority:3;index"`
-	TenantKey        string `json:"tenant_key" gorm:"type:varchar(64);index"`
+	TenantKey        string `json:"tenant_key" gorm:"type:varchar(64);index"` // denormalized users.username at event time
 	UserID           int    `json:"user_id" gorm:"index"`
 	TokenID          int    `json:"token_id" gorm:"index"`
 	TokenName        string `json:"token_name" gorm:"type:varchar(191)"`
@@ -94,7 +89,7 @@ type Attribution struct {
 	SourceType    string `json:"source_type" gorm:"type:varchar(16);uniqueIndex:idx_nova_attribution_source,priority:1"`
 	SourceKey     string `json:"source_key" gorm:"type:varchar(128);uniqueIndex:idx_nova_attribution_source,priority:2"`
 	TenantID      int64  `json:"tenant_id" gorm:"index"`
-	TenantKey     string `json:"tenant_key" gorm:"type:varchar(64);index"`
+	TenantKey     string `json:"tenant_key" gorm:"type:varchar(64);index"` // denormalized users.username
 	UserID        int    `json:"user_id" gorm:"index"`
 	TokenID       int    `json:"token_id" gorm:"index"`
 	NovaRequestID string `json:"nova_request_id" gorm:"type:varchar(128);index"`
@@ -109,18 +104,19 @@ const (
 )
 
 // QuotaOperation records a durable business-level quota adjustment identity.
-// Unique on (tenant_key, target_type, target_ref, operation_id) so the same
-// Nova operation_id cannot be applied twice even with a new Idempotency-Key.
+// Unique on (tenant_key, target_type, target_ref, operation_id/order_no).
+// tenant_key stores users.username. absolute_quota is set for absolute mode.
 type QuotaOperation struct {
-	ID          int64  `json:"id"`
-	TenantKey   string `json:"tenant_key" gorm:"type:varchar(64);uniqueIndex:idx_nova_quota_operation,priority:1"`
-	TargetType  string `json:"target_type" gorm:"type:varchar(16);uniqueIndex:idx_nova_quota_operation,priority:2"`
-	TargetRef   string `json:"target_ref" gorm:"type:varchar(64);uniqueIndex:idx_nova_quota_operation,priority:3"`
-	OperationID string `json:"operation_id" gorm:"type:varchar(128);uniqueIndex:idx_nova_quota_operation,priority:4"`
-	Delta       int    `json:"delta"`
-	Reason      string `json:"reason" gorm:"type:varchar(255)"`
-	ResultQuota int    `json:"result_quota"`
-	CreatedAt   int64  `json:"created_at" gorm:"bigint"`
+	ID            int64  `json:"id"`
+	TenantKey     string `json:"tenant_key" gorm:"type:varchar(64);uniqueIndex:idx_nova_quota_operation,priority:1"`
+	TargetType    string `json:"target_type" gorm:"type:varchar(16);uniqueIndex:idx_nova_quota_operation,priority:2"`
+	TargetRef     string `json:"target_ref" gorm:"type:varchar(64);uniqueIndex:idx_nova_quota_operation,priority:3"`
+	OrderNo       string `json:"order_no" gorm:"column:operation_id;type:varchar(128);uniqueIndex:idx_nova_quota_operation,priority:4"`
+	Delta         int    `json:"delta"`
+	AbsoluteQuota *int   `json:"absolute_quota,omitempty" gorm:"column:absolute_quota"`
+	Reason        string `json:"reason" gorm:"type:varchar(255)"`
+	ResultQuota   int    `json:"result_quota"`
+	CreatedAt     int64  `json:"created_at" gorm:"bigint"`
 }
 
 func (QuotaOperation) TableName() string { return "nova_quota_operations" }

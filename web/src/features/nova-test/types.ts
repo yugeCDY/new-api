@@ -44,7 +44,6 @@ export type NovaRequestSpec = {
   bearerToken?: string
   tenantKey?: string
   novaRequestId?: string
-  idempotencyKey?: string
   headers?: Record<string, string>
 }
 

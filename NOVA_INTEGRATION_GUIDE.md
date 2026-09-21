@@ -4,7 +4,7 @@
 
 | 项 | 值 |
 |---|---|
-| 文档版本 | 1.3（额度幂等：HTTP Key 与业务 `operation_id` 解耦） |
+| 文档版本 | 1.4（额度调整：`order_no` + `delta_quota`/`absolute_quota`） |
 | 对应实现 | New-API Nova 集成（`integration/nova`） |
 | 管理 API 前缀 | `/api/novapay` |
 | MQ Exchange | `nova.events`（topic，durable） |
@@ -54,10 +54,9 @@ SECRET = base64.urlsafe_b64decode("I-66qs2nySY-TOMGme6pD3to1nUEViopwRZ8fQzwLhk" 
 # len(SECRET) == 32
 ```
 
-请求头固定：
+请求头（`X-Nova-Key-Id` 可省略，省略则用 current）：
 
 ```http
-X-Nova-Key-Id: current
 X-Nova-Timestamp: <unix秒>
 X-Nova-Nonce: <22-128位 URL-safe>
 X-Nova-Signature: <HMAC-SHA256 lowercase hex>
@@ -102,7 +101,7 @@ X-Nova-Request-Id: <任意唯一字符串>
 ### 0.5 推荐最小验证顺序（给联调 Agent）
 
 1. **HMAC 健康检查**  
-   `GET http://127.0.0.1:3000/api/novapay/health` + 正确签名 → `200` 且 `status=ok`，`rabbitmq.connected=true`。  
+   `GET http://127.0.0.1:3000/api/novapay/health` + 正确签名 → `200` 且 `data.status=up`，`data.database.connected=true`，`data.mq.connected=true`。  
    故意改坏 `X-Nova-Signature` → `401` / `nova_authentication_failed`。
 
 2. **管理面抽查**  
@@ -211,7 +210,7 @@ NOVA_HMAC_KEYS=current:I-66qs2nySY-TOMGme6pD3to1nUEViopwRZ8fQzwLhk
 
 | Header | 说明 |
 |---|---|
-| `X-Nova-Key-Id` | 本机填 `current` |
+| `X-Nova-Key-Id` | **可选**。省略时使用 `NOVA_HMAC_KEYS` 里的第一把（current）。单密钥部署可不传；密钥轮换时再显式指定 |
 | `X-Nova-Timestamp` | Unix 秒（UTC） |
 | `X-Nova-Nonce` | 22–128 字符，`[A-Za-z0-9_-]`；至少约 128 bit 熵 |
 | `X-Nova-Signature` | HMAC-SHA256 结果的 **lowercase hex**（64 字符） |
@@ -257,7 +256,6 @@ signature = hex_encode( HMAC-SHA256(secret_bytes, canonical_string) )
 import base64, hashlib, hmac, time, secrets, urllib.parse, urllib.request, json
 
 BASE = "http://127.0.0.1:3000"
-KEY_ID = "current"
 SECRET = base64.urlsafe_b64decode("I-66qs2nySY-TOMGme6pD3to1nUEViopwRZ8fQzwLhk" + "==")
 
 def canonical_query(query: str) -> str:
@@ -283,8 +281,8 @@ def sign(method: str, path: str, query: str, body: bytes) -> dict:
         body_hash,
     ])
     sig = hmac.new(SECRET, canonical.encode("utf-8"), hashlib.sha256).hexdigest()
+    # X-Nova-Key-Id is optional for single-key deployments.
     return {
-        "X-Nova-Key-Id": KEY_ID,
         "X-Nova-Timestamp": ts,
         "X-Nova-Nonce": nonce,
         "X-Nova-Signature": sig,
@@ -318,36 +316,41 @@ print(urllib.request.urlopen(req).read().decode())
 Base：`http://127.0.0.1:3000`
 
 - 全部需要 HMAC（含 `/health`）
-- **写操作**必须带 `Idempotency-Key`：`^[A-Za-z0-9._:-]{8,128}$`
-- HTTP 幂等维度是 **`(scope, Idempotency-Key)`**：
-  - **同一 scope + 同一 Idempotency-Key + 同一 body hash** → 返回原结果，响应头 `Idempotency-Replayed: true`
-  - **同一 scope + 同一 Idempotency-Key + 不同 body hash** → `409` / `idempotency_conflict`
-  - 额度接口 scope **不含** `operation_id`：`tenant_quota:{tenant_key}`、`token_quota:{tenant_key}:{token_name}`
-- **额度业务防重**另有一层：表 `nova_quota_operations` 对 `(tenant_key, target_type, target_ref, operation_id)` 唯一
-  - 同一 `operation_id` + 相同 `delta`/`reason`（即使换了新的 `Idempotency-Key`）→ 不重复加减，body 带 `"replayed": true`
-  - 同一 `operation_id` + 不同 `delta`/`reason` → `409` / `operation_conflict`
+- **写操作**必须在 body 带 `request_id`：`^[A-Za-z0-9._:-]{8,128}$`（无 body 的写接口也要传 `{"request_id":"..."}`）
+- **不再使用**请求头 `Idempotency-Key`
+- HTTP 幂等维度是 **`(scope, request_id)`**：
+  - **同一 scope + 同一 `request_id` + 同一 body hash** → 返回原结果，响应头 `Idempotency-Replayed: true`
+  - **同一 scope + 同一 `request_id` + 不同 body hash** → `409` / `idempotency_conflict`
+  - 租户额度 scope：`tenant_quota:{tenant_key}`（业务防重另用 `order_no`）；令牌额度 scope：`token_quota:{tenant_key}:{token_name}`（仅 `request_id`）
+- **额度业务防重**另有一层：表 `nova_quota_operations` 对 `(tenant_key, target_type, target_ref, order_no)` 唯一（库列名仍为 `operation_id`）
+  - 同一 `order_no` + 相同调额参数/`reason`（即使换了新的 `request_id`）→ 不重复加减，body 带 `"replayed": true`
+  - 同一 `order_no` + 不同调额参数/`reason` → `409` / `operation_conflict`
 - 分页：`page`（默认 1）、`page_size`（默认 20，最大 100）
 - 额度单位：New-API **quota 整数**（非美元）；范围 `0 .. 2^53-1`
+- **统一响应格式**：
+  - 成功：`{ "success": true, "message": "ok", "data": ... }`
+  - 租户列表的 `total` / `page` / `page_size` / `items` 在 `data` 内；用量账本的分页字段仍在顶层
+  - 失败：`{ "success": false, "code": "...", "message": "<错误信息>", "request_id": "..." }`
 
 ### 4.1 路由一览
 
-| 方法 | 路径 | 幂等头 | 用途 |
+| 方法 | 路径 | 幂等（body `request_id`） | 用途 |
 |---|---|---|---|
 | `POST` | `/api/novapay/tenant` | 是 | 创建租户 + 专属用户 + 初始 Token |
 | `GET` | `/api/novapay/tenant/{tenant_key}` | 否 | 查询租户 |
-| `PUT` | `/api/novapay/tenant/{tenant_key}` | 是 | 更新显示名 / metadata |
+| `PUT` | `/api/novapay/tenant/{tenant_key}` | 是 | 更新显示名 |
 | `DELETE` | `/api/novapay/tenant/{tenant_key}` | 是 | 软删除（不可再启用） |
-| `GET` | `/api/novapay/tenants` | 否 | 分页列表 |
+| `GET` | `/api/novapay/tenants` | 否 | 分页列表；可按 `keyword`、`status` 过滤 |
 | `POST` | `/api/novapay/tenant/{tenant_key}/quota` | 是 | 调整租户用户余额 |
 | `POST` | `/api/novapay/tenant/{tenant_key}/disable` | 是 | 禁用租户及全部 Token |
 | `POST` | `/api/novapay/tenant/{tenant_key}/enable` | 是 | 启用租户（**不**自动启用曾单独禁用的 Token） |
-| `POST` | `/api/novapay/tenant/{tenant_key}/token/rotate` | 是 | 轮换 Token，明文只返回一次 |
-| `GET` | `/api/novapay/tenant/{tenant_key}/tokens` | 否 | Token 列表（仅掩码） |
-| `POST` | `/api/novapay/tenant/{tenant_key}/tokens/{token_name}/quota` | 是 | 调整 Token 额度 |
+| `POST` | `/api/novapay/tenant/{tenant_key}/token/rotate` | 是 | 密钥轮换；明文在首次与同 `request_id` 重放时返回 |
+| `GET` | `/api/novapay/tenant/{tenant_key}/tokens` | 否 | 租户密钥查询（含完整 key） |
+| `POST` | `/api/novapay/tenant/{tenant_key}/tokens/{token_name}/quota` | 是 | 令牌级额度设置（`remain_quota` / `unlimited_quota`） |
 | `DELETE` | `/api/novapay/tenant/{tenant_key}/tokens/{token_name}` | 是 | 吊销 Token |
 | `GET` | `/api/novapay/tenant/{tenant_key}/logs` | 否 | 成功用量账本 |
-| `GET` | `/api/novapay/models` | 否 | 可用模型 / 定价视图 |
-| `GET` | `/api/novapay/health` | 否 | 模块 / DB / MQ / 积压 |
+| `GET` | `/api/novapay/models` | 否 | 可用模型目录（渠道数、计费、端点） |
+| `GET` | `/api/novapay/health` | 否 | 主库 / Redis / MQ / outbox 积压 |
 
 本机可先测（只读，少触发限流）：
 
@@ -360,107 +363,266 @@ Base：`http://127.0.0.1:3000`
 
 | 字段 | 规则 |
 |---|---|
-| `tenant_key` | `^[A-Za-z0-9][A-Za-z0-9._-]{2,63}$`，创建后不可变 |
+| `tenant_key` | `^[A-Za-z0-9][A-Za-z0-9._-]{2,19}$`（3–20），写入 `users.username`，创建后不可变 |
+| `tenant_name` / `display_name` | 最长 20（写入 `users.display_name`） |
 | `token_name` | `^[A-Za-z0-9][A-Za-z0-9._-]{0,49}$` |
-| `operation_id`（额度调整） | 1–128，`[A-Za-z0-9._:-]` |
-| `display_name` | 最长 128 |
+| `order_no`（额度调整） | 1–128，`[A-Za-z0-9._:-]` |
+| `request_id`（全部写接口） | 8–128，`[A-Za-z0-9._:-]` |
 
 ### 4.2.1 软删除语义（已实测）
 
-- `DELETE /api/novapay/tenant/{tenant_key}` 为**软删除**：账本与历史保留。
-- 之后 `GET /api/novapay/tenant/{tenant_key}` 仍返回 **HTTP 200**，body 中 `status=deleted`（**不是 404**）。
-- 客户端应以 `status` 字段判断是否可用。
+- `DELETE /api/novapay/tenant/{tenant_key}` 为**软删除**：对应用户 `users.deleted_at` 置位，账本与历史保留。
+- 之后 `GET /api/novapay/tenant/{tenant_key}` 仍返回 **HTTP 200**，body 中 `data.status=deleted`（**不是 404**）。
+- 客户端应以 `data.status` 字段判断是否可用。
 - 对已删除租户再 `enable` / `update` / 调额等写操作 → **409** / `tenant_deleted`。
+
+路径参数 `{tenant_key}` 即 `users.username`。租户状态来自用户表：`enabled` / `disabled` 对应 `users.status`，`deleted` 对应用户软删。
+
+### 4.2.2 租户列表
+
+`GET /api/novapay/tenants?page=1&page_size=20&keyword=tmts&status=enabled`
+
+`keyword` 匹配 `username`、`display_name`（大小写不敏感）。`status` 只能是 `enabled` / `disabled` / `deleted`。不返回 token 明文或 `token_key`。
+
+```json
+{
+  "success": true,
+  "message": "ok",
+  "data": {
+    "total": 37,
+    "page": 1,
+    "page_size": 20,
+    "items": [
+      {
+        "username": "tmts-a",
+        "user_id": 18,
+        "display_name": "tmts",
+        "status": "enabled",
+        "quota": 4820000,
+        "used_quota": 180000,
+        "created_at": 1710000000,
+        "last_active_at": 1710003600
+      }
+    ]
+  }
+}
+```
+
+`created_at` / `last_active_at` 为 Unix 秒。`last_active_at` 取最近一次成功用量与用户最后登录时间中较晚的一个；用户记录已删除时 `username` 为空、额度按 0。
+
+### 4.2.3 查询租户详情
+
+`GET http://127.0.0.1:3000/api/novapay/tenant/{tenant_key}`
+
+返回租户详情；`token_key` 为掩码（完整明文仅创建/轮换时返回）。`status`：`enabled` / `disabled` / `deleted`。`created_at` / `last_active_at` 为 RFC3339 UTC。
+
+```json
+{
+  "success": true,
+  "message": "ok",
+  "data": {
+    "user_id": 18,
+    "username": "tmts44j8p8g2r",
+    "display_name": "示例科技有限公司",
+    "status": "enabled",
+    "quota": 4820000,
+    "used_quota": 180000,
+    "token_name": "nova-tmts44j8p8g2r",
+    "token_key": "sk-xxxx**********xxxx",
+    "created_at": "2026-09-13T08:00:00Z",
+    "last_active_at": "2026-09-13T09:30:00Z"
+  }
+}
+```
 
 ### 4.3 创建租户
 
 `POST http://127.0.0.1:3000/api/novapay/tenant`
 
+不需要 `Idempotency-Key` 头；**所有写接口**幂等统一靠 body 里的 `request_id`。
+
 ```json
 {
-  "tenant_key": "agent-test-001",
-  "display_name": "Agent Test",
-  "quota": 1000000,
-  "token_name": "default",
-  "token_quota": 1000000,
-  "unlimited_quota": false,
-  "metadata": { "biz": "optional" }
+  "tenant_key": "tmts44j8p8g2r",
+  "tenant_name": "示例科技有限公司",
+  "initial_quota": 5000000,
+  "request_id": "req-20260913-0001"
 }
 ```
 
-成功响应（首次）：
+| 字段 | 说明 |
+|---|---|
+| `tenant_key` | 必填；平台租户唯一键 |
+| `tenant_name` | 必填；展示名称，最长 20（写入 `users.display_name`） |
+| `initial_quota` | 必填；初始额度（用户余额与初始 Token 额度） |
+| `request_id` | 必填；请求唯一号，规则 `^[A-Za-z0-9._:-]{8,128}$` |
+
+成功响应：
 
 ```json
 {
   "success": true,
-  "tenant": {
-    "tenant_key": "agent-test-001",
-    "display_name": "Agent Test",
-    "status": "enabled",
-    "user_id": 123,
-    "quota": 1000000,
-    "created_at": 1726646400,
-    "updated_at": 1726646400
-  },
-  "token": {
-    "name": "default",
-    "token": "sk-xxxxxxxx",
-    "masked_token": "sk-****xxxx",
-    "status": 1,
-    "remain_quota": 1000000,
-    "unlimited_quota": false,
-    "created_at": 1726646400,
-    "secret_visible": true
+  "message": "ok",
+  "data": {
+    "user_id": 18,
+    "username": "tmts44j8p8g2r",
+    "token_name": "nova-tmts44j8p8g2r",
+    "token_key": "sk-xxxxxxxx",
+    "quota": 5000000
   }
 }
 ```
 
-**重要：**
-
-- `token` 明文只在**首次成功响应**出现；请立即安全存储。
-- 幂等重放不会再次返回明文，而是 `secret_visible: false` 并提示仅首次可见。
-- 列表 / 查询接口只返回 `masked_token`。
-- 若不想新建租户，直接使用第 0.3 节已有租户与 Token。
+- `username` 等于创建时传入的 `tenant_key`（存于 `users.username`）
+- `token_name` 为 `nova-` + `tenant_key`（超长会截断到 50）
+- 相同 `request_id` + 相同 body 重放时返回同一 `token_key`，并带 `Idempotency-Replayed: true`
+- 相同 `request_id` + 不同 body → `409` / `idempotency_conflict`
+- 若不想新建租户，直接使用第 0.3 节已有租户与 Token
 
 ### 4.4 调整额度
 
 `POST http://127.0.0.1:3000/api/novapay/tenant/{tenant_key}/quota`
 
+增量模式：
+
 ```json
 {
-  "operation_id": "op-20260918-001",
-  "delta": 50000,
-  "reason": "topup"
+  "request_id": "req-20260913-0002",
+  "order_no": "R2026091300001",
+  "delta_quota": 1000000,
+  "reason": "recharge"
 }
 ```
 
-- `delta` 可为负（扣减）；不会把余额扣到允许范围以下。
-- Token 额度：`POST .../tokens/{token_name}/quota`，body 相同。
-- **两层防重（方案 1+2）**：
+绝对值模式（二选一，不可同时传）：
+
+```json
+{
+  "request_id": "req-20260913-0003",
+  "order_no": "R2026091300002",
+  "absolute_quota": 6000000,
+  "reason": "reconcile"
+}
+```
+
+成功响应示例：
+
+```json
+{
+  "success": true,
+  "message": "ok",
+  "data": {
+    "username": "tenant-a",
+    "quota_before": 4820000,
+    "quota_after": 5820000,
+    "delta_quota": 1000000,
+    "order_no": "R2026091300001",
+    "reason": "recharge",
+    "replayed": false
+  }
+}
+```
+
+- `delta_quota` 可为负（扣减）；`absolute_quota` 直接设定目标余额。二者必须且只能传一个。
+- 不会把余额扣到允许范围以下，也不会超过钱包上限。
+- **两层防重**：
   | 层 | 作用 | 行为 |
   |---|---|---|
-  | `Idempotency-Key` | HTTP 超时重试 | 同 Key 同 body → 原响应 + `Idempotency-Replayed: true`；同 Key 不同 body → `409 idempotency_conflict` |
-  | `operation_id` | 业务单号（库唯一） | 同 `operation_id` 同 payload → 不重复加减，`"replayed": true`；同 `operation_id` 不同 payload → `409 operation_conflict` |
-  - 网络重试：复用同一 `Idempotency-Key` 即可。
-  - 业务重试 / 换 Key 再发：只要 `operation_id` 与 payload 不变，也不会二次加减。
-  - 新的一笔调额：必须使用**新的** `operation_id`（并建议新的 `Idempotency-Key`）。
+  | `request_id` | HTTP 超时重试 | 同 `request_id` 同 body → 原响应 + `Idempotency-Replayed: true`；同 `request_id` 不同 body → `409 idempotency_conflict` |
+  | `order_no` | 业务单号（库唯一） | 同 `order_no` 同 payload → 不重复加减，`"replayed": true`；同 `order_no` 不同 payload → `409 operation_conflict` |
+  - 网络重试：复用同一 `request_id` 即可。
+  - 业务重试 / 换 `request_id` 再发：只要 `order_no` 与 payload 不变，也不会二次加减。
+  - 新的一笔调额：必须使用**新的** `order_no`（并建议新的 `request_id`）。
 
-### 4.5 轮换 Token
+### 4.5 密钥轮换
 
 `POST http://127.0.0.1:3000/api/novapay/tenant/{tenant_key}/token/rotate`
 
 ```json
 {
-  "old_token_name": "live",
-  "new_token_name": "live-v2",
-  "token_quota": 1000000,
-  "unlimited_quota": false
+  "reason": "疑似泄露",
+  "request_id": "req-20260913-0004"
 }
 ```
 
-- 创建新 Token 并吊销旧 Token。
-- 新明文同样只返回一次。
-- **注意**：轮换后第 0.3 节的旧 `sk-...` 会立即失效，需改用新明文。
+成功响应示例：
+
+```json
+{
+  "success": true,
+  "message": "ok",
+  "data": {
+    "old_token_name": "nova-tenant-a",
+    "token_name": "nova-tenant-a",
+    "token_key": "sk-xxxxxxxx"
+  }
+}
+```
+
+- 就地轮换租户主令牌（默认名 `nova-{tenant_key}`）的密钥；令牌名与额度不变。
+- 旧 `sk-...` **立即失效**；新明文仅在首次响应与同 `request_id` 重放时返回（重放带 `Idempotency-Replayed: true`）。
+- `reason` 必填（1–255），用于说明轮换原因。
+
+### 4.5.2 令牌级额度设置
+
+`POST http://127.0.0.1:3000/api/novapay/tenant/{tenant_key}/tokens/{token_name}/quota`
+
+```json
+{
+  "remain_quota": 500000,
+  "unlimited_quota": false,
+  "reason": "员工额度调整",
+  "request_id": "req-20260913-token-quota-1"
+}
+```
+
+成功响应示例：
+
+```json
+{
+  "success": true,
+  "message": "ok",
+  "data": {
+    "token_name": "nova-tenant-a",
+    "remain_quota": 500000,
+    "unlimited_quota": false
+  }
+}
+```
+
+- 直接设置该 Token 的 `remain_quota` / `unlimited_quota`（New-API 原生字段；`unlimited_quota=false` 时按 Token 扣费）。
+- 幂等仅依赖 `request_id`（无 `order_no`）。
+- 若 Token 因额度耗尽为 `exhausted`，设置后额度可用时会恢复为 `enabled`。
+
+### 4.5.1 租户密钥查询
+
+`GET http://127.0.0.1:3000/api/novapay/tenant/{tenant_key}/tokens`
+
+```json
+{
+  "success": true,
+  "message": "ok",
+  "data": {
+    "items": [
+      {
+        "token_id": 7,
+        "token_name": "nova-tenant-a",
+        "key": "sk-xxxxxxxx",
+        "status": "enabled",
+        "expired_time": -1,
+        "remain_quota": 4820000,
+        "unlimited_quota": false,
+        "used_quota": 180000,
+        "created_time": 1726200000
+      }
+    ]
+  }
+}
+```
+
+- 返回该租户下全部 API 密钥，**含完整 `key` 明文**（仅管理面 HMAC 可访问）。
+- `status`：`enabled` / `disabled` / `expired` / `exhausted`。
+- `expired_time` 为 Unix 秒；`-1` 表示永不过期。`created_time` 同为 Unix 秒。
 
 ### 4.6 用量日志
 
@@ -469,6 +631,46 @@ Base：`http://127.0.0.1:3000`
 返回 Nova **事件账本**（非 `logs` / `quota_data` 表），字段包括：
 
 `event_id`、`source_type`（`relay` / `task`）、`source_key`、`tenant_key`、`quota`、`model_name`、`prompt_tokens`、`completion_tokens`、`total_tokens`、`request_id`、`nova_request_id`、`occurred_at` 等。
+
+### 4.6.1 模型目录
+
+`GET http://127.0.0.1:3000/api/novapay/models`
+
+只返回当前可路由的模型（启用中的渠道能力）。不返回渠道密钥、上游地址或渠道名称。
+
+```json
+{
+  "success": true,
+  "message": "ok",
+  "data": {
+    "items": [
+      {
+        "model_name": "kwjm-openai/deepseek-v4-flash",
+        "channel_count": 2,
+        "enabled": true,
+        "quota_type": 0,
+        "model_ratio": 1,
+        "completion_ratio": 1,
+        "enable_groups": ["default"],
+        "supported_endpoint_types": ["openai"]
+      }
+    ]
+  }
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `model_name` | 调用时使用的模型名 |
+| `channel_count` | 当前启用渠道数（同一渠道多分组只计 1） |
+| `enabled` | 至少有 1 个启用渠道 |
+| `description` / `tags` / `vendor_name` | 有元数据时才出现 |
+| `quota_type` | `0` 按 token 倍率，`1` 按次计价 |
+| `model_ratio` / `completion_ratio` | `quota_type=0` 时出现 |
+| `model_price` | `quota_type=1` 时出现，单位与网关定价一致 |
+| `cache_ratio` 等 | 仅该模型配置了对应倍率时出现 |
+| `enable_groups` | 可使用该模型的分组 |
+| `supported_endpoint_types` | 可调用的协议端点，如 `openai` |
 
 ### 4.7 健康检查
 
@@ -479,35 +681,51 @@ Base：`http://127.0.0.1:3000`
 ```json
 {
   "success": true,
-  "status": "ok",
-  "components": {
-    "database": { "ok": true },
-    "outbox": {
-      "pending": 0,
-      "dead": 0,
-      "oldest_pending_at": 0
-    },
-    "usage_candidates": {
-      "unresolved": 0,
-      "oldest_created_at": 0
-    },
-    "rabbitmq": {
-      "configured": true,
+  "message": "ok",
+  "data": {
+    "status": "up",
+    "database": {
       "connected": true
+    },
+    "redis": {
+      "enabled": true,
+      "connected": true
+    },
+    "mq": {
+      "connected": true,
+      "outbox_pending": 0,
+      "outbox_dead": 0
     }
-  },
-  "timestamp": "2026-09-18T00:00:00Z"
+  }
 }
 ```
+
+探测范围（Nova 相关中间件）：
+
+| 组件 | 是否必选 | 说明 |
+|---|---|---|
+| `database` | 必选 | 主库；租户、幂等、nonce、账本、outbox 都在这里 |
+| `mq` | 必选 | RabbitMQ；用量事件发布；`outbox_*` 为积压指标 |
+| `redis` | 可选 | 宿主网关缓存/额度路径；未配置 `REDIS_CONN_STRING` 时 `enabled=false`，不影响 `status` |
+
+不纳入本接口：日志库 / ClickHouse（Nova 账本不走它们）、RabbitMQ Management HTTP（仅运维 UI）。
+
+`status`：`up` / `degraded` / `down`。
+
+- `down`：主库不可用
+- `degraded`：主库可用，但 MQ 未连通，或 Redis 已启用却不可达
+- `up`：上述必选依赖正常（Redis 未启用时忽略）
 
 建议告警：
 
 | 条件 | 建议 |
 |---|---|
-| `outbox.dead > 0` | 立即告警 |
-| 最老 pending 超过 5 分钟 | 告警 |
-| `usage_candidates.unresolved` 长时间不清零 | 告警并人工核对（见第 7 节） |
-| `status` 为 `degraded` / `unavailable` | 告警 |
+| `data.database.connected == false` | 立即告警 |
+| `data.mq.connected == false` | 立即告警 |
+| `data.redis.enabled == true && data.redis.connected == false` | 告警 |
+| `data.mq.outbox_pending > 1000` | 告警 |
+| `data.mq.outbox_dead > 0` | 立即告警 |
+| `data.status` 为 `degraded` / `down` | 告警 |
 
 ### 4.8 通用错误体
 
@@ -533,7 +751,6 @@ POST /v1/chat/completions HTTP/1.1
 Host: 127.0.0.1:3000
 Authorization: Bearer sk-4xTTb2l6uBAJLLy2djr8qfMFTxaRs4ABhuAxaCSDmqopzBQn
 Content-Type: application/json
-X-Nova-Key-Id: current
 X-Nova-Timestamp: <unix秒>
 X-Nova-Nonce: ...
 X-Nova-Signature: ...
@@ -650,7 +867,7 @@ New-API **不会**替 Nova 声明消费队列；请由测试方自行声明队�
 |---|---|
 | 事件账本 `nova_usage_events` | 成功用量权威记录；`/logs` 与 MQ 同源 |
 | Outbox | 与账本同事务写入；worker 发布到 MQ |
-| `usage_candidates`（health） | 结算前归属候选；成功落账后删除；4xx/5xx 会清理 |
+| `nova_attributions`（usage candidates） | 结算前归属候选；成功落账后删除；4xx/5xx 会清理；不再出现在 health 响应里 |
 
 **已知限制：**
 
@@ -662,22 +879,22 @@ New-API **不会**替 Nova 声明消费队列；请由测试方自行声明队�
 
 1. 以 New-API `/api/novapay/.../logs` 或 MQ 消费结果为准核对成功笔数与 `quota`。
 2. 差异时查 `event_id` / `source.key` / `nova_request_id`。
-3. 积压看 `/api/novapay/health` 的 `outbox` 与 `usage_candidates`。
+3. 积压看 `/api/novapay/health` 的 `data.mq.outbox_pending` / `data.mq.outbox_dead`。
 
 ---
 
 ## 8. 联调检查清单
 
 - [ ] HMAC：正确签名可通过；错误签名 / 过期时间 / 重放 nonce / 篡改 body 均 401
-- [ ] 创建租户拿到 `sk-` 明文；重放幂等不再返回明文（或使用第 0.3 节现成租户）
-- [ ] 额度增减：同 `Idempotency-Key` 重试不重复扣；同 `operation_id` 换新 Key 也不重复扣；同 `operation_id` 不同 delta → `operation_conflict`；新单号才再次生效
+- [ ] 创建租户拿到 `token_key`；相同 `request_id` 重放返回同一 `token_key`（或使用第 0.3 节现成租户）
+- [ ] 额度增减：同 `request_id` 重试不重复扣；同 `order_no` 换新 `request_id` 也不重复扣；同 `order_no` 不同 delta/absolute → `operation_conflict`；新单号才再次生效
 - [ ] 软删后 `GET` 仍 200 且 `status=deleted`；再启用/修改返回 409 `tenant_deleted`
 - [ ] 管理面累计约 20 次写操作后出现 429，约 20 分钟窗口后恢复
 - [ ] 用本机 Token + 归属头成功调用 `POST /v1/chat/completions`（`deepseek-v3`）
 - [ ] 错误 `X-Nova-Tenant-Key` 被拒绝
 - [ ] 成功请求后 `/logs` 出现记录，且 RabbitMQ 收到同 `event_id` 消息
 - [ ] 故意重复投递同一消息，消费端不重复记账
-- [ ] `/health` 在 MQ 正常时为 `ok`
+- [ ] `/health` 在主库与 MQ 正常时为 `data.status=up`
 
 ---
 
@@ -685,7 +902,7 @@ New-API **不会**替 Nova 声明消费队列；请由测试方自行声明队�
 
 | # | 实测结论 | 文档处理 |
 |---|---|---|
-| 1 | 旧实现：额度 scope 含 `operation_id`，换 Key 会二次加减 | **已改为** HTTP scope 不含 `operation_id` + `nova_quota_operations` 业务唯一（见 4 / 4.4） |
+| 1 | 旧实现：额度 scope 含业务单号，换 Key 会二次加减 | **已改为** HTTP scope 不含 `order_no` + `nova_quota_operations` 业务唯一（见 4 / 4.4） |
 | 2 | 软删后 `GET /tenant/{key}` 返回 200 + `status=deleted`，不是 404 | 已补充 4.2.1 |
 | 3 | 管理面约 20 次 / 20 分钟限流生效，与文档一致 | 无需改动（见 0.6） |
 
@@ -696,7 +913,7 @@ New-API **不会**替 Nova 声明消费队列；请由测试方自行声明队�
 1. 本文件第 0 节密钥与 Token **仅限本机联调**；生产必须轮换并改走 TLS / AMQPS。
 2. Secret / Token 明文不得写入业务日志、MQ payload、URL、前端。
 3. 密钥轮换：先加 previous，再切 current；移除 previous 前须超过最大时间窗与在途请求时长。
-4. 写接口务必使用唯一 `Idempotency-Key`（建议 UUID）。
+4. 写接口务必使用唯一 `request_id`（建议 UUID）。
 
 ---
 

@@ -12,10 +12,10 @@ import (
 	"gorm.io/gorm/clause"
 )
 
-var idempotencyKeyPattern = regexp.MustCompile(`^[A-Za-z0-9._:-]{8,128}$`)
+var requestIDPattern = regexp.MustCompile(`^[A-Za-z0-9._:-]{8,128}$`)
 
 var (
-	errIdempotencyConflict = errors.New("idempotency key was already used for a different request")
+	errIdempotencyConflict = errors.New("request_id was already used for a different request")
 	errIdempotencyRunning  = errors.New("idempotent operation is still processing")
 )
 
@@ -32,16 +32,15 @@ type idempotentResponse struct {
 	Replayed bool
 }
 
-func executeIdempotent(c *gin.Context, scope string, mutate func(*gorm.DB) (mutationResult, error)) (idempotentResponse, error) {
-	key := c.GetHeader("Idempotency-Key")
-	if !idempotencyKeyPattern.MatchString(key) {
-		return idempotentResponse{}, newAPIError(http.StatusBadRequest, "invalid_idempotency_key", "a valid Idempotency-Key header is required")
+func executeIdempotent(c *gin.Context, scope, requestID string, mutate func(*gorm.DB) (mutationResult, error)) (idempotentResponse, error) {
+	if !requestIDPattern.MatchString(requestID) {
+		return idempotentResponse{}, newAPIError(http.StatusBadRequest, "invalid_request", "request_id is invalid")
 	}
 	requestHash := c.GetString("nova_body_hash")
 	_, db := currentState()
 
 	var existing IdempotencyRecord
-	err := db.Where("scope = ? AND idempotency_key = ?", scope, key).First(&existing).Error
+	err := db.Where("scope = ? AND idempotency_key = ?", scope, requestID).First(&existing).Error
 	if err == nil {
 		return replayIdempotent(existing, requestHash)
 	}
@@ -55,7 +54,7 @@ func executeIdempotent(c *gin.Context, scope string, mutate func(*gorm.DB) (muta
 		now := time.Now().Unix()
 		record := IdempotencyRecord{
 			Scope:          scope,
-			IdempotencyKey: key,
+			IdempotencyKey: requestID,
 			RequestHash:    requestHash,
 			Status:         "processing",
 			ExpiresAt:      now + int64((24*time.Hour)/time.Second),
@@ -93,7 +92,7 @@ func executeIdempotent(c *gin.Context, scope string, mutate func(*gorm.DB) (muta
 	})
 	if errors.Is(err, errIdempotencyRunning) {
 		var concurrent IdempotencyRecord
-		if queryErr := db.Where("scope = ? AND idempotency_key = ?", scope, key).First(&concurrent).Error; queryErr != nil {
+		if queryErr := db.Where("scope = ? AND idempotency_key = ?", scope, requestID).First(&concurrent).Error; queryErr != nil {
 			return idempotentResponse{}, err
 		}
 		return replayIdempotent(concurrent, requestHash)

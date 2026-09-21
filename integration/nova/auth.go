@@ -18,6 +18,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -51,7 +52,6 @@ func HMACAuth() gin.HandlerFunc {
 		}
 
 		c.Set("nova_authenticated", true)
-		c.Set("nova_key_id", c.GetHeader(headerKeyID))
 		c.Next()
 	}
 }
@@ -73,7 +73,12 @@ func RelayAttribution() gin.HandlerFunc {
 			c.Next()
 			return
 		}
-		if err != nil || tenant.Status != tenantStatusEnabled {
+		if err != nil {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"success": false, "code": "nova_tenant_unavailable", "message": "tenant is unavailable"})
+			return
+		}
+		var user model.User
+		if err := db.Select("id", "username", "status", "deleted_at").First(&user, userID).Error; err != nil || user.DeletedAt.Valid || user.Status != common.UserStatusEnabled {
 			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"success": false, "code": "nova_tenant_unavailable", "message": "tenant is unavailable"})
 			return
 		}
@@ -103,13 +108,13 @@ func RelayAttribution() gin.HandlerFunc {
 		}
 		c.Request.Body = reader
 		bodyHash := hex.EncodeToString(digest.Sum(nil))
-		if c.GetHeader("X-Nova-Tenant-Key") != tenant.TenantKey || !verifyAndReserve(c, config, db, bodyHash) {
+		if c.GetHeader("X-Nova-Tenant-Key") != user.Username || !verifyAndReserve(c, config, db, bodyHash) {
 			if !c.IsAborted() {
 				rejectAuthentication(c, "tenant")
 			}
 			return
 		}
-		service.SetUsageAttribution(c, service.UsageAttribution{Provider: "nova", Subject: tenant.TenantKey, RequestID: c.GetHeader("X-Nova-Request-Id"), Verified: true})
+		service.SetUsageAttribution(c, service.UsageAttribution{Provider: "nova", Subject: user.Username, RequestID: c.GetHeader("X-Nova-Request-Id"), Verified: true})
 		c.Set("nova_token_id", tokenID)
 		requestID := c.GetString(common.RequestIdKey)
 		if requestID != "" {
@@ -123,7 +128,11 @@ func RelayAttribution() gin.HandlerFunc {
 }
 
 func verifyAndReserve(c *gin.Context, config Config, db *gorm.DB, bodyHash string) bool {
-	keyID := c.GetHeader(headerKeyID)
+	keyID := strings.TrimSpace(c.GetHeader(headerKeyID))
+	if keyID == "" {
+		// Single-key deployments can omit X-Nova-Key-Id; use the configured current key.
+		keyID = config.CurrentKeyID
+	}
 	timestampRaw := c.GetHeader(headerTimestamp)
 	nonce := c.GetHeader(headerNonce)
 	signatureRaw := c.GetHeader(headerSignature)
@@ -150,6 +159,7 @@ func verifyAndReserve(c *gin.Context, config Config, db *gorm.DB, bodyHash strin
 		rejectAuthentication(c, "replay")
 		return false
 	}
+	c.Set("nova_key_id", keyID)
 	return true
 }
 
