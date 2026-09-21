@@ -11,32 +11,25 @@ type Tenant struct {
 
 func (Tenant) TableName() string { return "nova_tenants" }
 
-type UsageEvent struct {
-	ID               int64  `json:"id"`
-	EventID          string `json:"event_id" gorm:"type:varchar(64);uniqueIndex"`
-	SourceType       string `json:"source_type" gorm:"type:varchar(16);uniqueIndex:idx_nova_usage_source,priority:1"`
-	SourceKey        string `json:"source_key" gorm:"type:varchar(128);uniqueIndex:idx_nova_usage_source,priority:2"`
-	TenantID         int64  `json:"tenant_id" gorm:"uniqueIndex:idx_nova_usage_source,priority:3;index"`
-	TenantKey        string `json:"tenant_key" gorm:"type:varchar(64);index"` // denormalized users.username at event time
-	UserID           int    `json:"user_id" gorm:"index"`
-	TokenID          int    `json:"token_id" gorm:"index"`
-	TokenName        string `json:"token_name" gorm:"type:varchar(191)"`
-	RequestID        string `json:"request_id" gorm:"type:varchar(128);index"`
-	NovaRequestID    string `json:"nova_request_id" gorm:"type:varchar(128);index"`
-	ModelName        string `json:"model_name" gorm:"type:varchar(191);index"`
-	UpstreamModel    string `json:"upstream_model" gorm:"type:varchar(191)"`
-	ChannelID        int    `json:"channel_id"`
-	GroupName        string `json:"group" gorm:"type:varchar(64)"`
-	Quota            int    `json:"quota"`
-	PromptTokens     int    `json:"prompt_tokens"`
-	CompletionTokens int    `json:"completion_tokens"`
-	TotalTokens      int    `json:"total_tokens"`
-	UsagePayload     string `json:"usage_payload,omitempty" gorm:"type:text"`
-	OccurredAt       int64  `json:"occurred_at" gorm:"bigint;index"`
-	CreatedAt        int64  `json:"created_at" gorm:"bigint"`
+// LogRef associates a Nova request with its authoritative New API consume log.
+// The log database remains the source for usage and billing fields; this table
+// only provides tenant-scoped correlation, idempotency, and outbox recovery.
+type LogRef struct {
+	ID            int64  `json:"id" gorm:"index:idx_nova_log_ref_tenant_id,priority:2"`
+	EventID       string `json:"event_id" gorm:"type:varchar(64);uniqueIndex"`
+	SourceType    string `json:"source_type" gorm:"type:varchar(16);uniqueIndex:idx_nova_log_ref_source,priority:1"`
+	SourceKey     string `json:"source_key" gorm:"type:varchar(128);uniqueIndex:idx_nova_log_ref_source,priority:2"`
+	TenantKey     string `json:"tenant_key" gorm:"type:varchar(64);uniqueIndex:idx_nova_log_ref_source,priority:3;index:idx_nova_log_ref_timeline,priority:1;index:idx_nova_log_ref_request,priority:1;index:idx_nova_log_ref_tenant_id,priority:1"`
+	UserID        int    `json:"user_id" gorm:"index"`
+	RequestID     string `json:"request_id" gorm:"type:varchar(128);index:idx_nova_log_ref_request,priority:2"`
+	NovaRequestID string `json:"nova_request_id" gorm:"type:varchar(128)"`
+	TokenID       int    `json:"token_id" gorm:"index"`
+	LogID         int    `json:"log_id" gorm:"index"`
+	OccurredAt    int64  `json:"occurred_at" gorm:"bigint;index:idx_nova_log_ref_timeline,priority:2"`
+	CreatedAt     int64  `json:"created_at" gorm:"bigint"`
 }
 
-func (UsageEvent) TableName() string { return "nova_usage_events" }
+func (LogRef) TableName() string { return "nova_log_ref" }
 
 type Outbox struct {
 	ID            int64  `json:"id"`
@@ -122,9 +115,25 @@ type QuotaOperation struct {
 func (QuotaOperation) TableName() string { return "nova_quota_operations" }
 
 func migrate(db *gorm.DB) error {
-	return db.AutoMigrate(
+	// Usage events were historical snapshots. They are intentionally discarded
+	// when moving to log references, together with their dependent outbox rows.
+	if db.Migrator().HasTable("nova_usage_events") {
+		if db.Migrator().HasTable(&Outbox{}) {
+			if err := db.Where("event_id IN (SELECT event_id FROM nova_usage_events)").Delete(&Outbox{}).Error; err != nil {
+				return err
+			}
+		}
+		if err := db.Migrator().DropTable("nova_usage_events"); err != nil {
+			return err
+		}
+	}
+	migrationDB := db
+	if db.Dialector.Name() == "mysql" {
+		migrationDB = db.Set("gorm:table_options", "CHARSET=utf8mb4")
+	}
+	return migrationDB.AutoMigrate(
 		&Tenant{},
-		&UsageEvent{},
+		&LogRef{},
 		&Outbox{},
 		&IdempotencyRecord{},
 		&ReplayNonce{},

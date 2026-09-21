@@ -19,8 +19,8 @@ type UsageAttribution struct {
 	Verified  bool
 }
 
-func RecordRelayFinalizedUsage(c *gin.Context, relayInfo *relaycommon.RelayInfo, quota, promptTokens, completionTokens int) {
-	if relayInfo == nil || quota < 0 {
+func RecordRelayFinalizedUsage(c *gin.Context, relayInfo *relaycommon.RelayInfo, quota, logID int) {
+	if relayInfo == nil || quota < 0 || logID <= 0 {
 		return
 	}
 	requestID := c.GetString(common.RequestIdKey)
@@ -35,36 +35,29 @@ func RecordRelayFinalizedUsage(c *gin.Context, relayInfo *relaycommon.RelayInfo,
 		SourceKey:        requestID,
 		UserID:           relayInfo.UserId,
 		TokenID:          relayInfo.TokenId,
-		TokenName:        c.GetString("token_name"),
 		RequestID:        requestID,
-		ModelName:        relayInfo.OriginModelName,
-		UpstreamModel:    relayInfo.UpstreamModelName,
-		ChannelID:        relayInfo.ChannelId,
-		GroupName:        relayInfo.UsingGroup,
+		LogID: logID,
 		Quota:            quota,
-		PromptTokens:     promptTokens,
-		CompletionTokens: completionTokens,
-		TotalTokens:      promptTokens + completionTokens,
 		OccurredAt:       time.Now().Unix(),
 	})
 }
 
 func RecordTaskFinalizedUsage(ctx context.Context, task *model.Task, taskResult *relaycommon.TaskInfo) {
-	if task == nil || taskResult == nil || task.Status != model.TaskStatusSuccess || task.Quota < 0 {
+	if task == nil || taskResult == nil || task.Status != model.TaskStatusSuccess || task.Quota < 0 || task.PrivateData.UsageLogID <= 0 {
 		return
+	}
+	requestID := ""
+	if task.PrivateData.Execution != nil {
+		requestID = task.PrivateData.Execution.RequestID
 	}
 	RecordFinalizedUsageContext(ctx, UsageLifecycleEvent{
 		SourceType:       "task",
 		SourceKey:        task.TaskID,
 		UserID:           task.UserId,
 		TokenID:          task.PrivateData.TokenId,
-		ModelName:        taskModelName(task),
-		ChannelID:        task.ChannelId,
-		GroupName:        task.Group,
+		RequestID: requestID,
+		LogID: task.PrivateData.UsageLogID,
 		Quota:            task.Quota,
-		PromptTokens:     max(taskResult.TotalTokens-taskResult.CompletionTokens, 0),
-		CompletionTokens: taskResult.CompletionTokens,
-		TotalTokens:      taskResult.TotalTokens,
 		OccurredAt:       time.Now().Unix(),
 	})
 }
@@ -75,16 +68,9 @@ type UsageLifecycleEvent struct {
 	SourceKey        string
 	UserID           int
 	TokenID          int
-	TokenName        string
 	RequestID        string
-	ModelName        string
-	UpstreamModel    string
-	ChannelID        int
-	GroupName        string
+	LogID            int
 	Quota            int
-	PromptTokens     int
-	CompletionTokens int
-	TotalTokens      int
 	OccurredAt       int64
 	Attribution      *UsageAttribution
 }

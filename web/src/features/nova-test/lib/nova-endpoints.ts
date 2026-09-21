@@ -222,7 +222,7 @@ export const NOVA_ENDPOINTS: NovaEndpointTemplate[] = [
     descriptionKey:
       'Reads successful Nova usage events for ledger and MQ reconciliation.',
     method: 'GET',
-    path: '/api/novapay/tenant/{{tenant_key}}/logs?page=1&page_size=20',
+    path: '/api/novapay/tenant/{{tenant_key}}/logs?size=100',
     headers: JSON_HEADERS,
     body: '',
     category: 'management',

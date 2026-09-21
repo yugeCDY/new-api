@@ -507,7 +507,9 @@ export async function consumeRabbitMessages(
       parsed = null
     }
     const eventId =
-      parsed?.event_id ?? message.properties?.message_id ?? '(missing event_id)'
+      message.properties?.message_id ||
+      parsed?.event_id ||
+      '(missing event_id)'
     const duplicate = seenEventIds.has(eventId)
     seenEventIds.add(eventId)
     return {

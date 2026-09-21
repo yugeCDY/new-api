@@ -31,9 +31,69 @@ import (
 	"gorm.io/gorm/clause"
 )
 
+type legacyUsageEvent struct {
+	ID         int64  `json:"id"`
+	EventID    string `gorm:"type:varchar(64);uniqueIndex"`
+	SourceType string `gorm:"type:varchar(16)"`
+	SourceKey  string `gorm:"type:varchar(128)"`
+	TenantID   int64  `gorm:"index"`
+	CreatedAt  int64  `gorm:"bigint"`
+}
+
+func (legacyUsageEvent) TableName() string { return "nova_usage_events" }
+
 func TestNovaMigrationIsIdempotent(t *testing.T) {
 	db := openTestDatabase(t)
 	testNovaMigrationContract(t, db)
+}
+
+func TestNovaMigrationRebuildsLegacyUsageEventsAndClearsOutbox(t *testing.T) {
+	db := openTestDatabase(t)
+	testNovaLegacyUsageMigration(t, db)
+}
+
+func TestNovaMigrationRebuildsLegacyUsageEventsAndClearsOutboxMySQL(t *testing.T) {
+	dsn := strings.TrimSpace(os.Getenv("TEST_MYSQL_DSN"))
+	if dsn == "" {
+		t.Skip("TEST_MYSQL_DSN is not configured")
+	}
+	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
+	require.NoError(t, err)
+	testNovaLegacyUsageMigration(t, db)
+}
+
+func TestNovaMigrationRebuildsLegacyUsageEventsAndClearsOutboxPostgreSQL(t *testing.T) {
+	dsn := strings.TrimSpace(os.Getenv("TEST_POSTGRES_DSN"))
+	if dsn == "" {
+		t.Skip("TEST_POSTGRES_DSN is not configured")
+	}
+	db, err := gorm.Open(postgres.New(postgres.Config{DSN: dsn, PreferSimpleProtocol: true}), &gorm.Config{})
+	require.NoError(t, err)
+	testNovaLegacyUsageMigration(t, db)
+}
+
+func testNovaLegacyUsageMigration(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	for _, table := range []any{&QuotaOperation{}, &Attribution{}, &ReplayNonce{}, &IdempotencyRecord{}, &Outbox{}, &LogRef{}, &Tenant{}} {
+		_ = db.Migrator().DropTable(table)
+	}
+	t.Cleanup(func() {
+		for _, table := range []any{&QuotaOperation{}, &Attribution{}, &ReplayNonce{}, &IdempotencyRecord{}, &Outbox{}, &LogRef{}, &Tenant{}} {
+			_ = db.Migrator().DropTable(table)
+		}
+	})
+	require.NoError(t, db.AutoMigrate(&legacyUsageEvent{}, &Outbox{}))
+	require.NoError(t, db.Create(&legacyUsageEvent{EventID: "legacy", SourceType: "relay", SourceKey: "legacy", TenantID: 1, CreatedAt: time.Now().Unix()}).Error)
+	require.NoError(t, db.Create(&Outbox{EventID: "legacy", Status: "pending", CreatedAt: time.Now().Unix(), UpdatedAt: time.Now().Unix()}).Error)
+
+	require.NoError(t, migrate(db))
+	require.NoError(t, migrate(db))
+	assert.True(t, db.Migrator().HasTable("nova_log_ref"))
+	var events, outbox int64
+	require.NoError(t, db.Model(&LogRef{}).Count(&events).Error)
+	require.NoError(t, db.Model(&Outbox{}).Count(&outbox).Error)
+	assert.Zero(t, events)
+	assert.Zero(t, outbox)
 }
 
 func TestNovaMigrationIsIdempotentMySQL(t *testing.T) {
@@ -100,7 +160,7 @@ func TestNovaUpgradePreservesExistingUserFixturePostgreSQL(t *testing.T) {
 
 func assertNovaUpgradePreservesFixture(t *testing.T, db *gorm.DB) {
 	t.Helper()
-	for _, table := range []any{&QuotaOperation{}, &Attribution{}, &ReplayNonce{}, &IdempotencyRecord{}, &Outbox{}, &UsageEvent{}, &Tenant{}} {
+	for _, table := range []any{&QuotaOperation{}, &Attribution{}, &ReplayNonce{}, &IdempotencyRecord{}, &Outbox{}, &LogRef{}, &Tenant{}} {
 		_ = db.Migrator().DropTable(table)
 	}
 	require.NoError(t, db.AutoMigrate(&model.User{}))
@@ -124,11 +184,11 @@ func assertNovaUpgradePreservesFixture(t *testing.T, db *gorm.DB) {
 
 func testNovaMigrationContract(t *testing.T, db *gorm.DB) {
 	t.Helper()
-	for _, table := range []any{&QuotaOperation{}, &Attribution{}, &ReplayNonce{}, &IdempotencyRecord{}, &Outbox{}, &UsageEvent{}, &Tenant{}} {
+	for _, table := range []any{&QuotaOperation{}, &Attribution{}, &ReplayNonce{}, &IdempotencyRecord{}, &Outbox{}, &LogRef{}, &Tenant{}} {
 		_ = db.Migrator().DropTable(table)
 	}
 	t.Cleanup(func() {
-		for _, table := range []any{&QuotaOperation{}, &Attribution{}, &ReplayNonce{}, &IdempotencyRecord{}, &Outbox{}, &UsageEvent{}, &Tenant{}} {
+		for _, table := range []any{&QuotaOperation{}, &Attribution{}, &ReplayNonce{}, &IdempotencyRecord{}, &Outbox{}, &LogRef{}, &Tenant{}} {
 			_ = db.Migrator().DropTable(table)
 		}
 	})
@@ -137,7 +197,7 @@ func testNovaMigrationContract(t *testing.T, db *gorm.DB) {
 
 	for _, table := range []string{
 		"nova_tenants",
-		"nova_usage_events",
+		"nova_log_ref",
 		"nova_outbox",
 		"nova_idempotency",
 		"nova_replay_nonces",
@@ -146,6 +206,14 @@ func testNovaMigrationContract(t *testing.T, db *gorm.DB) {
 	} {
 		assert.True(t, db.Migrator().HasTable(table), table)
 	}
+	assert.True(t, db.Migrator().HasColumn(&LogRef{}, "nova_request_id"))
+	require.NoError(t, db.Migrator().DropColumn(&LogRef{}, "NovaRequestID"))
+	require.NoError(t, migrate(db))
+	assert.True(t, db.Migrator().HasColumn(&LogRef{}, "nova_request_id"))
+	assert.True(t, db.Migrator().HasIndex(&LogRef{}, "idx_nova_log_ref_tenant_id"))
+	require.NoError(t, db.Migrator().DropIndex(&LogRef{}, "idx_nova_log_ref_tenant_id"))
+	require.NoError(t, migrate(db))
+	assert.True(t, db.Migrator().HasIndex(&LogRef{}, "idx_nova_log_ref_tenant_id"))
 
 	now := time.Now().Unix()
 	tenant := Tenant{UserID: 1001, CreatedAt: now, UpdatedAt: now}
@@ -157,17 +225,13 @@ func testNovaMigrationContract(t *testing.T, db *gorm.DB) {
 	require.NoError(t, db.Create(&nonce).Error)
 	assert.Error(t, db.Create(&ReplayNonce{KeyID: nonce.KeyID, NonceHash: nonce.NonceHash, RequestTimestamp: now, ExpiresAt: now + 600, CreatedAt: now}).Error)
 
-	usage := UsageEvent{EventID: "matrix-event", SourceType: "relay", SourceKey: "matrix-request", TenantID: tenant.ID, TenantKey: "matrix-tenant", CreatedAt: now}
+	usage := LogRef{EventID: "matrix-event", SourceType: "relay", SourceKey: "matrix-request", TenantKey: "matrix-tenant", LogID: 1, CreatedAt: now}
 	require.NoError(t, db.Create(&usage).Error)
 	duplicateUsage := usage
 	duplicateUsage.ID = 0
 	created := db.Clauses(clause.OnConflict{DoNothing: true}).Create(&duplicateUsage)
 	require.NoError(t, created.Error)
 	assert.EqualValues(t, 0, created.RowsAffected)
-	require.NoError(t, reconcileMissingOutbox(db, Config{Exchange: "nova.events", RoutingKey: "nova.usage.reported", BatchSize: 10}, time.Now()))
-	var reconciledOutboxCount int64
-	require.NoError(t, db.Model(&Outbox{}).Where("event_id = ?", usage.EventID).Count(&reconciledOutboxCount).Error)
-	assert.EqualValues(t, 1, reconciledOutboxCount)
 
 	quotaOp := QuotaOperation{
 		TenantKey: "matrix-tenant", TargetType: quotaTargetTenant, TargetRef: "",
@@ -344,7 +408,7 @@ func TestListTenantsKeepsOrphanWhenUserIsGone(t *testing.T) {
 	require.NoError(t, db.Create(&orphan).Error)
 	require.NoError(t, db.Delete(&orphan).Error)
 	require.NoError(t, db.Create(&Tenant{UserID: orphan.Id, CreatedAt: now, UpdatedAt: now}).Error)
-	require.NoError(t, db.Create(&UsageEvent{EventID: "list-active-1", SourceType: "relay", SourceKey: "list-active-1", TenantID: okTenant.ID, TenantKey: user.Username, OccurredAt: now, CreatedAt: now}).Error)
+	require.NoError(t, db.Create(&LogRef{EventID: "list-active-1", SourceType: "relay", SourceKey: "list-active-1", TenantKey: user.Username, LogID: 1, OccurredAt: now, CreatedAt: now}).Error)
 
 	router := gin.New()
 	RegisterRoutes(router.Group("/api"))
@@ -850,55 +914,57 @@ func TestFinalizedUsageCreatesOneLedgerAndOutboxRecord(t *testing.T) {
 	require.NoError(t, db.Create(&token).Error)
 	tenant := Tenant{UserID: user.Id, CreatedAt: time.Now().Unix(), UpdatedAt: time.Now().Unix()}
 	require.NoError(t, db.Create(&tenant).Error)
+	consumeLog := model.Log{UserId: user.Id, TokenId: token.Id, Type: model.LogTypeConsume, ModelName: "test-model", TokenName: token.Name, Quota: 42, PromptTokens: 10, CompletionTokens: 5, CreatedAt: time.Now().Unix()}
+	require.NoError(t, model.LOG_DB.Create(&consumeLog).Error)
 
 	event := service.UsageLifecycleEvent{
-		SourceType:       "relay",
-		SourceKey:        "request-123",
-		UserID:           user.Id,
-		TokenID:          token.Id,
-		TokenName:        token.Name,
-		RequestID:        "request-123",
-		ModelName:        "test-model",
-		Quota:            42,
-		PromptTokens:     10,
-		CompletionTokens: 5,
-		TotalTokens:      15,
-		Attribution:      &service.UsageAttribution{Provider: "nova", Subject: user.Username, RequestID: "nova-request-1", Verified: true},
+		SourceType:  "relay",
+		SourceKey:   "request-123",
+		UserID:      user.Id,
+		TokenID:     token.Id,
+		RequestID:   "request-123",
+		LogID:       consumeLog.Id,
+		Quota:       42,
+		Attribution: &service.UsageAttribution{Provider: "nova", Subject: user.Username, RequestID: "nova-request-1", Verified: true},
 	}
 	require.NoError(t, recordFinalizedUsage(event))
 	require.NoError(t, recordFinalizedUsage(event))
 
 	var eventCount int64
 	var outboxCount int64
-	require.NoError(t, db.Model(&UsageEvent{}).Count(&eventCount).Error)
+	require.NoError(t, db.Model(&LogRef{}).Count(&eventCount).Error)
 	require.NoError(t, db.Model(&Outbox{}).Count(&outboxCount).Error)
 	assert.EqualValues(t, 1, eventCount)
 	assert.EqualValues(t, 1, outboxCount)
 
-	var stored UsageEvent
+	var stored LogRef
 	require.NoError(t, db.First(&stored).Error)
 	assert.Equal(t, event.SourceKey, stored.SourceKey)
-	assert.Equal(t, 42, stored.Quota)
-	assert.Equal(t, 10, stored.PromptTokens)
-	assert.Equal(t, 5, stored.CompletionTokens)
+	assert.Equal(t, consumeLog.Id, stored.LogID)
+	assert.Equal(t, "nova-request-1", stored.NovaRequestID)
 
 	var outbox Outbox
 	require.NoError(t, db.First(&outbox).Error)
 	assert.Equal(t, "pending", outbox.Status)
-	assert.Contains(t, outbox.Payload, `"event_type":"nova.usage.reported"`)
+	assert.Contains(t, outbox.Payload, `"tenant_key":"nova-ledger-user"`)
+	assert.Contains(t, outbox.Payload, `"quota_data"`)
+	assert.Contains(t, outbox.Payload, `"model_name":"test-model"`)
+	assert.NotContains(t, outbox.Payload, `"event_type"`)
+	assert.NotContains(t, outbox.Payload, `"has_more"`)
 	assert.NotContains(t, outbox.Payload, `"usage_payload"`)
 	assert.NotContains(t, outbox.Payload, token.Key)
 	require.NoError(t, db.Delete(&outbox).Error)
 	require.NoError(t, reconcileMissingOutbox(db, Config{Exchange: "nova.events", RoutingKey: "nova.usage.reported", BatchSize: 10}, time.Now()))
 	outbox = Outbox{}
 	require.NoError(t, db.First(&outbox).Error)
-	var message struct {
-		Source struct {
-			Key string `json:"key"`
-		} `json:"source"`
-	}
+	var message usageLogResponse
 	require.NoError(t, common.UnmarshalJsonStr(outbox.Payload, &message))
-	assert.Equal(t, event.SourceKey, message.Source.Key)
+	assert.Equal(t, user.Username, message.TenantKey)
+	assert.Equal(t, "request-123", message.RequestID)
+	assert.Equal(t, stored.ID, message.ID)
+	assert.Equal(t, "nova-request-1", message.NovaRequestID)
+	assert.EqualValues(t, 42, message.QuotaData["quota"])
+	assert.Equal(t, "test-model", message.Log["model_name"])
 }
 
 func TestGenericTaskObserverRecordsOnlyFinalSuccess(t *testing.T) {
@@ -917,23 +983,183 @@ func TestGenericTaskObserverRecordsOnlyFinalSuccess(t *testing.T) {
 	require.NoError(t, db.Create(&tenant).Error)
 	require.NoError(t, db.Create(&Attribution{SourceType: "task", SourceKey: "task-success", TenantID: tenant.ID, TenantKey: user.Username, UserID: user.Id, TokenID: token.Id, NovaRequestID: "nova-task-request", CreatedAt: time.Now().Unix()}).Error)
 
-	task := &model.Task{TaskID: "task-success", UserId: user.Id, Status: model.TaskStatusSuccess, Quota: 77, Group: "default"}
+	task := &model.Task{TaskID: "task-success", UserId: user.Id, Status: model.TaskStatusSuccess, Quota: 77, Group: "default", Action: "text_to_video"}
 	task.PrivateData.TokenId = token.Id
-	service.RecordTaskFinalizedUsage(context.Background(), task, &relaycommon.TaskInfo{Status: model.TaskStatusSuccess, TotalTokens: 12, CompletionTokens: 5})
+	consumeLog := model.Log{UserId: user.Id, TokenId: token.Id, Type: model.LogTypeConsume, ModelName: "video-model", Quota: 77, CreatedAt: time.Now().Unix(), Other: `{"request_path":"/v1/videos","usage_facts":{"video_count":1,"seconds":5,"resolution":"832*480"}}`}
+	require.NoError(t, model.LOG_DB.Create(&consumeLog).Error)
+	task.PrivateData.UsageLogID = consumeLog.Id
+	task.PrivateData.Execution = &model.TaskExecutionSnapshot{RequestID: "task-request", RequestPath: "/v1/videos"}
+	service.RecordTaskFinalizedUsage(context.Background(), task, &relaycommon.TaskInfo{Status: model.TaskStatusSuccess, TotalTokens: 12, CompletionTokens: 5, UsageFacts: map[string]any{"video_count": float64(1), "seconds": float64(5), "resolution": "832*480"}})
 
 	failedTask := &model.Task{TaskID: "task-failure", UserId: user.Id, Status: model.TaskStatusFailure, Quota: 10}
 	failedTask.PrivateData.TokenId = token.Id
 	service.RecordTaskFinalizedUsage(context.Background(), failedTask, &relaycommon.TaskInfo{Status: model.TaskStatusFailure})
 
-	var events []UsageEvent
-	require.NoError(t, db.Find(&events).Error)
-	require.Len(t, events, 1)
-	assert.Equal(t, "task-success", events[0].SourceKey)
-	assert.Equal(t, 77, events[0].Quota)
-	assert.Equal(t, 12, events[0].TotalTokens)
+	var refs []LogRef
+	require.NoError(t, db.Find(&refs).Error)
+	require.Len(t, refs, 1)
+	assert.Equal(t, "task-success", refs[0].SourceKey)
+	assert.Equal(t, consumeLog.Id, refs[0].LogID)
+	assert.Equal(t, "task-request", refs[0].RequestID)
+	assert.Equal(t, "nova-task-request", refs[0].NovaRequestID)
 	var attributionCount int64
 	require.NoError(t, db.Model(&Attribution{}).Count(&attributionCount).Error)
 	assert.Zero(t, attributionCount)
+}
+
+func TestUsageLogsReadCurrentConsumeLogDetails(t *testing.T) {
+	db := openTestDatabase(t)
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}))
+	require.NoError(t, migrate(db))
+	secret := bytes.Repeat([]byte{0x63}, 32)
+	setTestRuntime(t, db, secret)
+	user := model.User{Username: "nova-usage-detail", Password: "unused", Status: common.UserStatusEnabled, Group: "default", AffCode: "nova-usage-detail-aff"}
+	require.NoError(t, db.Create(&user).Error)
+	require.NoError(t, db.Create(&Tenant{UserID: user.Id, CreatedAt: time.Now().Unix(), UpdatedAt: time.Now().Unix()}).Error)
+	expr := `tier("short", p * 1.2)`
+	previousDB := model.DB
+	model.DB = db
+	t.Cleanup(func() { model.DB = previousDB })
+	require.NoError(t, db.AutoMigrate(&model.Channel{}))
+	require.NoError(t, db.Create(&model.Channel{Id: 7, Name: "bailian", Key: "channel-secret"}).Error)
+	consumeLog := model.Log{UserId: user.Id, TokenId: 3, ChannelId: 7, Type: model.LogTypeConsume, ModelName: "deepseek-r1", Quota: 346, PromptTokens: 8, CompletionTokens: 132, RequestId: "request-detail", Content: "模型倍率 1.20", CreatedAt: 1_789_915_301, Other: fmt.Sprintf(`{"request_path":"/v1/chat/completions","cache_tokens":0,"reasoning_tokens":126,"reasoning_effort":"high","frt":320,"billing_mode":"tiered_expr","billing_unit":"token","matched_tier":"short","model_ratio":1.2,"usage_facts":{"input":8},"expr_b64":"%s","admin_info":{"reject_reason":"hidden"}}`, base64.StdEncoding.EncodeToString([]byte(expr)))}
+	require.NoError(t, model.LOG_DB.Create(&consumeLog).Error)
+	require.NoError(t, db.Create(&LogRef{EventID: "usage-detail", SourceType: "relay", SourceKey: "usage-detail", TenantKey: user.Username, UserID: user.Id, RequestID: "request-detail", NovaRequestID: "nova-request-detail", LogID: consumeLog.Id, OccurredAt: 1_789_915_301, CreatedAt: 1_789_915_302}).Error)
+
+	router := gin.New()
+	RegisterRoutes(router.Group("/api"))
+	request := signedRequest(t, secret, http.MethodGet, "/api/novapay/tenant/nova-usage-detail/logs", strconvUnix(time.Now()), "usage-detail-list-nonce", nil, nil)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	var envelope map[string]any
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &envelope))
+	assert.Nil(t, envelope["total"])
+	assert.Nil(t, envelope["page"])
+	assert.Nil(t, envelope["page_size"])
+	var body struct {
+		Data struct {
+			HasMore bool               `json:"has_more"`
+			Items   []usageLogResponse `json:"items"`
+		} `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &body))
+	assert.False(t, body.Data.HasMore)
+	require.Len(t, body.Data.Items, 1)
+	item := body.Data.Items[0]
+	var stored LogRef
+	require.NoError(t, db.Where("event_id = ?", "usage-detail").First(&stored).Error)
+	assert.Equal(t, stored.ID, item.ID)
+	assert.Equal(t, user.Username, item.TenantKey)
+	assert.Equal(t, user.Id, item.UserID)
+	assert.Equal(t, "request-detail", item.RequestID)
+	assert.Equal(t, "nova-request-detail", item.NovaRequestID)
+	assert.Equal(t, "text", item.ModelType)
+	assert.EqualValues(t, model.LogTypeConsume, item.Log["type"])
+	assert.Equal(t, "bailian", item.Log["channel_name"])
+	assert.EqualValues(t, 0, item.Log["use_time"])
+	assert.EqualValues(t, 320, item.Log["frt"])
+	assert.EqualValues(t, 8, item.Log["prompt_tokens"])
+	assert.EqualValues(t, 126, item.Log["reasoning_tokens"])
+	assert.EqualValues(t, 346, item.QuotaData["quota"])
+	assert.NotContains(t, item.QuotaData, "desc")
+	assert.Equal(t, "tiered_expr", item.QuotaData["billing_mode"])
+	assert.Equal(t, "token", item.QuotaData["billing_unit"])
+	assert.Equal(t, expr, item.QuotaData["expr"])
+	assert.NotContains(t, item.QuotaData, "frt")
+	assert.NotContains(t, item.QuotaData, "expr_b64")
+	assert.Equal(t, "/v1/chat/completions", item.Other["request_path"])
+	assert.Equal(t, "high", item.Other["reasoning_effort"])
+	assert.Equal(t, "模型倍率 1.20", item.Other["content"])
+	assert.NotContains(t, item.Other, "admin_info")
+	assert.NotContains(t, response.Body.String(), "channel-secret")
+	assert.NotContains(t, response.Body.String(), "hidden")
+	assert.EqualValues(t, 0, item.Log["cache_tokens"])
+}
+
+func TestUsageLogsSeekByLastIDAndTime(t *testing.T) {
+	db := openTestDatabase(t)
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}))
+	require.NoError(t, migrate(db))
+	secret := bytes.Repeat([]byte{0x64}, 32)
+	setTestRuntime(t, db, secret)
+	user := model.User{Username: "nova-usage-seek", Password: "unused", Status: common.UserStatusEnabled, Group: "default", AffCode: "nova-usage-seek-aff"}
+	require.NoError(t, db.Create(&user).Error)
+	require.NoError(t, db.Create(&Tenant{UserID: user.Id, CreatedAt: time.Now().Unix(), UpdatedAt: time.Now().Unix()}).Error)
+	previousDB := model.DB
+	model.DB = db
+	t.Cleanup(func() { model.DB = previousDB })
+
+	occurredAt := []int64{1_700_000_100, 1_700_000_200, 1_700_000_050}
+	logIDs := make([]int, len(occurredAt))
+	refs := make([]LogRef, len(occurredAt))
+	for i, at := range occurredAt {
+		consumeLog := model.Log{UserId: user.Id, TokenId: 3, Type: model.LogTypeConsume, ModelName: "seek-model", Quota: i + 1, CreatedAt: at}
+		require.NoError(t, model.LOG_DB.Create(&consumeLog).Error)
+		logIDs[i] = consumeLog.Id
+		refs[i] = LogRef{
+			EventID: fmt.Sprintf("seek-%d", i), SourceType: "relay", SourceKey: fmt.Sprintf("seek-%d", i),
+			TenantKey: user.Username, UserID: user.Id, RequestID: fmt.Sprintf("seek-request-%d", i),
+			LogID: consumeLog.Id, OccurredAt: at, CreatedAt: at,
+		}
+		require.NoError(t, db.Create(&refs[i]).Error)
+	}
+
+	router := gin.New()
+	RegisterRoutes(router.Group("/api"))
+	fetch := func(nonce, rawQuery string) (bool, []usageLogResponse) {
+		t.Helper()
+		target := "/api/novapay/tenant/nova-usage-seek/logs"
+		if rawQuery != "" {
+			target += "?" + rawQuery
+		}
+		request := signedRequest(t, secret, http.MethodGet, target, strconvUnix(time.Now()), nonce, nil, nil)
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+		var body struct {
+			Data struct {
+				HasMore bool               `json:"has_more"`
+				Items   []usageLogResponse `json:"items"`
+			} `json:"data"`
+		}
+		require.NoError(t, common.Unmarshal(response.Body.Bytes(), &body))
+		return body.Data.HasMore, body.Data.Items
+	}
+
+	hasMore, byLastID := fetch("usage-seek-last-id-nonce", fmt.Sprintf("last_id=%d", refs[0].ID))
+	assert.False(t, hasMore)
+	require.Len(t, byLastID, 2)
+	assert.Equal(t, refs[1].ID, byLastID[0].ID)
+	assert.Equal(t, refs[2].ID, byLastID[1].ID)
+	assert.EqualValues(t, logIDs[1], byLastID[0].Log["id"])
+
+	exactPage, exactItems := fetch("usage-seek-exact-size-nonce", fmt.Sprintf("last_id=%d&size=2", refs[0].ID))
+	assert.True(t, exactPage)
+	require.Len(t, exactItems, 2)
+
+	_, filtered := fetch("usage-seek-time-nonce01", fmt.Sprintf("last_id=%d&start_time=1700000100&end_time=1700000200", refs[0].ID))
+	require.Len(t, filtered, 1)
+	assert.Equal(t, refs[1].ID, filtered[0].ID)
+
+	_, openEnded := fetch("usage-seek-open-end-nonce", fmt.Sprintf("last_id=%d&start_time=1700000200", refs[0].ID))
+	require.Len(t, openEnded, 1)
+	assert.Equal(t, refs[1].ID, openEnded[0].ID)
+
+	invalidCursor := signedRequest(t, secret, http.MethodGet, "/api/novapay/tenant/nova-usage-seek/logs?last_id=-1", strconvUnix(time.Now()), "usage-seek-bad-cursor-nonce", nil, nil)
+	invalidCursorResponse := httptest.NewRecorder()
+	router.ServeHTTP(invalidCursorResponse, invalidCursor)
+	require.Equal(t, http.StatusBadRequest, invalidCursorResponse.Code, invalidCursorResponse.Body.String())
+
+	invalidRange := signedRequest(t, secret, http.MethodGet, "/api/novapay/tenant/nova-usage-seek/logs?start_time=20&end_time=10", strconvUnix(time.Now()), "usage-seek-bad-range-nonce1", nil, nil)
+	invalidRangeResponse := httptest.NewRecorder()
+	router.ServeHTTP(invalidRangeResponse, invalidRange)
+	require.Equal(t, http.StatusBadRequest, invalidRangeResponse.Code, invalidRangeResponse.Body.String())
+
+	invalidSize := signedRequest(t, secret, http.MethodGet, "/api/novapay/tenant/nova-usage-seek/logs?size=0", strconvUnix(time.Now()), "usage-seek-bad-size-nonce01", nil, nil)
+	invalidSizeResponse := httptest.NewRecorder()
+	router.ServeHTTP(invalidSizeResponse, invalidSize)
+	require.Equal(t, http.StatusBadRequest, invalidSizeResponse.Code, invalidSizeResponse.Body.String())
 }
 
 func TestRabbitMQPublisherConfirm(t *testing.T) {
@@ -1090,7 +1316,7 @@ func assertSingleOutboxClaim(t *testing.T, db *gorm.DB) {
 	assert.NotEmpty(t, outbox.LockedBy)
 }
 
-func TestNonNovaAndFailedRelayDoNotCreateUsageEvents(t *testing.T) {
+func TestNonNovaAndFailedRelayDoNotCreateLogRefs(t *testing.T) {
 	db := openTestDatabase(t)
 	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}))
 	require.NoError(t, migrate(db))
@@ -1118,7 +1344,7 @@ func TestNonNovaAndFailedRelayDoNotCreateUsageEvents(t *testing.T) {
 	}), "invalid finalized usage event")
 
 	var eventCount int64
-	require.NoError(t, db.Model(&UsageEvent{}).Count(&eventCount).Error)
+	require.NoError(t, db.Model(&LogRef{}).Count(&eventCount).Error)
 	assert.Zero(t, eventCount)
 }
 
@@ -1132,7 +1358,7 @@ func TestRetentionCleanupRemovesOnlyExpiredOperationalRecords(t *testing.T) {
 	require.NoError(t, db.Create(&Outbox{EventID: "published-old", Status: "published", PublishedAt: old, CreatedAt: old, UpdatedAt: old}).Error)
 	require.NoError(t, db.Create(&Outbox{EventID: "dead-old", Status: "dead", CreatedAt: old, UpdatedAt: old}).Error)
 	require.NoError(t, db.Create(&Outbox{EventID: "pending-old", Status: "pending", CreatedAt: old, UpdatedAt: old}).Error)
-	require.NoError(t, db.Create(&UsageEvent{EventID: "usage-old", SourceType: "relay", SourceKey: "usage-old", TenantID: 1, OccurredAt: old, CreatedAt: old}).Error)
+	require.NoError(t, db.Create(&LogRef{EventID: "usage-old", SourceType: "relay", SourceKey: "usage-old", TenantKey: "old-tenant", LogID: 1, OccurredAt: old, CreatedAt: old}).Error)
 
 	require.NoError(t, cleanupExpiredRecords(db, Config{OutboxRetention: 30 * 24 * time.Hour, DeadRetention: 90 * 24 * time.Hour, EventRetention: 90 * 24 * time.Hour}, now))
 	var remaining []Outbox
@@ -1140,7 +1366,7 @@ func TestRetentionCleanupRemovesOnlyExpiredOperationalRecords(t *testing.T) {
 	require.Len(t, remaining, 1)
 	assert.Equal(t, "pending-old", remaining[0].EventID)
 	var usageCount int64
-	require.NoError(t, db.Model(&UsageEvent{}).Count(&usageCount).Error)
+	require.NoError(t, db.Model(&LogRef{}).Count(&usageCount).Error)
 	assert.Zero(t, usageCount)
 }
 
@@ -1149,6 +1375,10 @@ func openTestDatabase(t *testing.T) *gorm.DB {
 	dsnName := strings.NewReplacer("/", "_", " ", "_").Replace(t.Name()) + "_" + uuid.NewString()
 	db, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:%s?mode=memory&cache=shared", dsnName)), &gorm.Config{})
 	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&model.Log{}))
+	previousLogDB := model.LOG_DB
+	model.LOG_DB = db
+	t.Cleanup(func() { model.LOG_DB = previousLogDB })
 	return db
 }
 

@@ -78,7 +78,7 @@ func LogTaskConsumption(c *gin.Context, info *relaycommon.RelayInfo, task *model
 	}
 	appendTaskLogInfo(task, other)
 	attachQuotaSaturation(c, info, other)
-	model.RecordConsumeLog(c, info.UserId, model.RecordConsumeLogParams{
+	consumeLog := model.RecordConsumeLog(c, info.UserId, model.RecordConsumeLogParams{
 		ChannelId: info.ChannelId,
 		ModelName: info.OriginModelName,
 		TokenName: tokenName,
@@ -88,6 +88,14 @@ func LogTaskConsumption(c *gin.Context, info *relaycommon.RelayInfo, task *model
 		Group:     info.UsingGroup,
 		Other:     other,
 	})
+	if consumeLog != nil && task != nil {
+		task.PrivateData.UsageLogID = consumeLog.Id
+		if task.ID > 0 {
+			if err := model.DB.Model(task).Update("private_data", task.PrivateData).Error; err != nil {
+				logger.LogError(c, "failed to persist task usage log reference: "+err.Error())
+			}
+		}
+	}
 	model.UpdateUserUsedQuotaAndRequestCount(info.UserId, info.PriceData.Quota)
 	model.UpdateChannelUsedQuota(info.ChannelId, info.PriceData.Quota)
 }

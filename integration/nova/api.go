@@ -2,8 +2,10 @@ package nova
 
 import (
 	"crypto/sha256"
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"net/http"
 	"regexp"
@@ -272,22 +274,22 @@ func listTenants(c *gin.Context) {
 		return
 	}
 
-	tenantIDs := make([]int64, 0, len(rows))
+	tenantKeys := make([]string, 0, len(rows))
 	for _, row := range rows {
-		tenantIDs = append(tenantIDs, row.TenantID)
+		tenantKeys = append(tenantKeys, row.Username)
 	}
-	lastUsage := map[int64]int64{}
-	if len(tenantIDs) > 0 {
+	lastUsage := map[string]int64{}
+	if len(tenantKeys) > 0 {
 		var usageRows []struct {
-			TenantID int64 `gorm:"column:tenant_id"`
-			LastAt   int64 `gorm:"column:last_at"`
+			TenantKey string `gorm:"column:tenant_key"`
+			LastAt    int64  `gorm:"column:last_at"`
 		}
-		if err := db.Model(&UsageEvent{}).Select("tenant_id, MAX(occurred_at) AS last_at").Where("tenant_id IN ?", tenantIDs).Group("tenant_id").Scan(&usageRows).Error; err != nil {
+		if err := db.Model(&LogRef{}).Select("tenant_key, MAX(occurred_at) AS last_at").Where("tenant_key IN ?", tenantKeys).Group("tenant_key").Scan(&usageRows).Error; err != nil {
 			writeAPIError(c, err)
 			return
 		}
 		for _, row := range usageRows {
-			lastUsage[row.TenantID] = row.LastAt
+			lastUsage[row.TenantKey] = row.LastAt
 		}
 	}
 
@@ -295,8 +297,8 @@ func listTenants(c *gin.Context) {
 	for _, row := range rows {
 		user := model.User{Status: row.UserStatus, DeletedAt: row.DeletedAt, LastLoginAt: row.LastLoginAt}
 		lastActive := row.LastLoginAt
-		if lastUsage[row.TenantID] > lastActive {
-			lastActive = lastUsage[row.TenantID]
+		if lastUsage[row.Username] > lastActive {
+			lastActive = lastUsage[row.Username]
 		}
 		items = append(items, tenantListItem{
 			Username:     row.Username,
@@ -785,30 +787,257 @@ func enabledChannelCounts(db *gorm.DB) (map[string]int, error) {
 	return counts, nil
 }
 
+const (
+	usageLogDefaultSize = 100
+	usageLogMaxSize     = 100
+)
+
 func listUsageLogs(c *gin.Context) {
-	page, pageSize, err := pagination(c)
+	filter, err := parseUsageLogQuery(c)
 	if err != nil {
 		writeAPIError(c, err)
 		return
 	}
-	tenant, _, err := loadTenant(c.Param("tenant_key"))
+	tenantKey := c.Param("tenant_key")
+	_, _, err = loadTenant(tenantKey)
 	if err != nil {
 		writeAPIError(c, err)
 		return
 	}
 	_, db := currentState()
-	query := db.Model(&UsageEvent{}).Where("tenant_id = ?", tenant.ID)
-	var total int64
-	if err := query.Count(&total).Error; err != nil {
+	query := db.Model(&LogRef{}).Where("tenant_key = ? AND id > ?", tenantKey, filter.lastID)
+	if filter.startTime != nil {
+		query = query.Where("occurred_at >= ?", *filter.startTime)
+	}
+	if filter.endTime != nil {
+		query = query.Where("occurred_at <= ?", *filter.endTime)
+	}
+	var refs []LogRef
+	if err := query.Order("id ASC").Limit(filter.size).Find(&refs).Error; err != nil {
 		writeAPIError(c, err)
 		return
 	}
-	var events []UsageEvent
-	if err := query.Order("id DESC").Limit(pageSize).Offset((page - 1) * pageSize).Find(&events).Error; err != nil {
-		writeAPIError(c, err)
-		return
+	items := make([]usageLogResponse, 0, len(refs))
+	for _, ref := range refs {
+		item, err := usageLogRefResponse(ref)
+		if err != nil {
+			writeAPIError(c, err)
+			return
+		}
+		items = append(items, item)
 	}
-	c.JSON(http.StatusOK, successListBody(events, page, pageSize, total))
+	c.JSON(http.StatusOK, successBody(gin.H{
+		"has_more": len(items) == filter.size,
+		"items":    items,
+	}))
+}
+
+type usageLogQuery struct {
+	lastID    int64
+	size      int
+	startTime *int64
+	endTime   *int64
+}
+
+func parseUsageLogQuery(c *gin.Context) (usageLogQuery, error) {
+	filter := usageLogQuery{size: usageLogDefaultSize}
+	if raw := c.Query("last_id"); raw != "" {
+		lastID, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || lastID < 0 {
+			return usageLogQuery{}, newAPIError(http.StatusBadRequest, "invalid_cursor", "invalid last_id")
+		}
+		filter.lastID = lastID
+	}
+	if raw := c.Query("size"); raw != "" {
+		size, err := strconv.Atoi(raw)
+		if err != nil || size < 1 || size > usageLogMaxSize {
+			return usageLogQuery{}, newAPIError(http.StatusBadRequest, "invalid_size", "invalid size")
+		}
+		filter.size = size
+	}
+	startTime, err := optionalUnixQuery(c, "start_time")
+	if err != nil {
+		return usageLogQuery{}, err
+	}
+	endTime, err := optionalUnixQuery(c, "end_time")
+	if err != nil {
+		return usageLogQuery{}, err
+	}
+	if startTime != nil && endTime != nil && *startTime > *endTime {
+		return usageLogQuery{}, newAPIError(http.StatusBadRequest, "invalid_time_range", "invalid time range")
+	}
+	filter.startTime = startTime
+	filter.endTime = endTime
+	return filter, nil
+}
+
+func optionalUnixQuery(c *gin.Context, name string) (*int64, error) {
+	raw := c.Query(name)
+	if raw == "" {
+		return nil, nil
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || value < 0 {
+		return nil, newAPIError(http.StatusBadRequest, "invalid_time_range", "invalid time range")
+	}
+	return &value, nil
+}
+
+type usageLogResponse struct {
+	ID            int64          `json:"id"`
+	TenantKey     string         `json:"tenant_key"`
+	UserID        int            `json:"user_id"`
+	RequestID     string         `json:"request_id"`
+	NovaRequestID string         `json:"nova_request_id"`
+	ModelType     string         `json:"model_type"`
+	Log           map[string]any `json:"log"`
+	QuotaData     map[string]any `json:"quota_data"`
+	Other         map[string]any `json:"other,omitempty"`
+}
+
+// usageLogOtherKeys are token, timing, and request-identity fields from the
+// consume log's other JSON. Billing fields stay in quota_data.
+var usageLogOtherKeys = []string{
+	"frt",
+	"cache_tokens", "cache_creation_tokens", "cache_creation_tokens_5m", "cache_creation_tokens_1h", "cache_write_tokens",
+	"reasoning_tokens", "input_tokens_total",
+	"image_count", "image_output", "image_cache_tokens",
+	"audio_input", "audio_output", "text_input", "text_output", "audio_input_token_count",
+}
+
+// quotaDataOtherKeys are prices, ratios, and the tiered-billing snapshot.
+var quotaDataOtherKeys = []string{
+	"billing_mode", "billing_preference", "billing_source", "billing_unit", "billing_tokens",
+	"matched_tier", "model_price", "model_ratio", "completion_ratio", "cache_ratio", "cache_creation_ratio",
+	"cache_creation_ratio_5m", "cache_creation_ratio_1h",
+	"group_ratio", "user_group_ratio", "fixed_price", "usage_facts", "request_rules",
+	"tool_surcharges", "image_ratio", "image_generation_call", "image_generation_call_price", "image_generation_call_count",
+	"audio_ratio", "audio_completion_ratio", "audio_input_seperate_price", "audio_input_price",
+	"web_search", "web_search_call_count", "web_search_price",
+	"file_search", "file_search_call_count", "file_search_price",
+	"subscription_plan_id", "subscription_plan_title", "subscription_id",
+	"subscription_pre_consumed", "subscription_post_delta", "subscription_consumed",
+	"subscription_remain", "subscription_total", "subscription_used", "wallet_quota_deducted",
+	"violation_fee", "violation_fee_code", "violation_fee_marker", "fee_quota",
+}
+
+// hiddenLogOtherKeys are role-scoped or legacy-sensitive values. They are not
+// part of the tenant usage detail.
+var hiddenLogOtherKeys = map[string]struct{}{
+	"admin_info": {}, "root_info": {}, "audit_info": {}, "expr_b64": {},
+	"channel_id": {}, "channel_name": {}, "channel_type": {}, "reject_reason": {},
+}
+
+func usageLogRefResponse(ref LogRef) (usageLogResponse, error) {
+	consumeLog, err := consumeLogByID(ref.LogID)
+	if err != nil {
+		return usageLogResponse{}, err
+	}
+	var other map[string]any
+	if consumeLog.Other != "" {
+		if err := common.UnmarshalJsonStr(consumeLog.Other, &other); err != nil {
+			return usageLogResponse{}, err
+		}
+	}
+	log := map[string]any{
+		"id": consumeLog.Id, "type": consumeLog.Type, "model_name": consumeLog.ModelName,
+		"prompt_tokens": consumeLog.PromptTokens, "completion_tokens": consumeLog.CompletionTokens,
+		"total_tokens": consumeLog.PromptTokens + consumeLog.CompletionTokens,
+		"created_at":   time.Unix(consumeLog.CreatedAt, 0).UTC().Format(time.RFC3339),
+		"is_stream":    consumeLog.IsStream,
+	}
+	if consumeLog.TokenName != "" {
+		log["token_name"] = consumeLog.TokenName
+	}
+	if consumeLog.TokenId != 0 {
+		log["token_id"] = consumeLog.TokenId
+	}
+	if consumeLog.ChannelId != 0 {
+		log["channel_id"] = consumeLog.ChannelId
+	}
+	if name := channelNameByID(consumeLog.ChannelId); name != "" {
+		log["channel_name"] = name
+	}
+	if consumeLog.Group != "" {
+		log["group"] = consumeLog.Group
+	}
+	log["use_time"] = consumeLog.UseTime
+	if consumeLog.UpstreamRequestId != "" {
+		log["upstream_request_id"] = consumeLog.UpstreamRequestId
+	}
+	if consumeLog.Ip != "" {
+		log["ip"] = consumeLog.Ip
+	}
+	placed := maps.Clone(hiddenLogOtherKeys)
+	for _, key := range usageLogOtherKeys {
+		if value, ok := other[key]; ok {
+			log[key] = value
+			placed[key] = struct{}{}
+		}
+	}
+	quota := map[string]any{"quota": consumeLog.Quota,
+		"created_time": time.Unix(consumeLog.CreatedAt, 0).UTC().Format(time.RFC3339)}
+	if common.QuotaPerUnit > 0 {
+		quota["deducted_amount_usd"] = float64(consumeLog.Quota) / common.QuotaPerUnit
+	}
+	for _, key := range quotaDataOtherKeys {
+		if value, ok := other[key]; ok {
+			quota[key] = value
+			placed[key] = struct{}{}
+		}
+	}
+	if encoded, ok := other["expr_b64"].(string); ok && encoded != "" {
+		decoded, err := base64.StdEncoding.DecodeString(encoded)
+		if err == nil && len(decoded) > 0 {
+			quota["expr"] = string(decoded)
+		}
+	}
+	var extra map[string]any
+	for key, value := range other {
+		if _, skip := placed[key]; skip {
+			continue
+		}
+		if extra == nil {
+			extra = map[string]any{}
+		}
+		extra[key] = value
+	}
+	if consumeLog.Content != "" {
+		if extra == nil {
+			extra = map[string]any{}
+		}
+		extra["content"] = consumeLog.Content
+	}
+	modelType := "text"
+	if path, ok := other["request_path"].(string); ok {
+		switch {
+		case strings.HasPrefix(path, "/v1/images"):
+			modelType = "image"
+		case strings.HasPrefix(path, "/v1/videos"):
+			modelType = "video"
+		}
+	}
+	requestID := ref.RequestID
+	if requestID == "" {
+		requestID = consumeLog.RequestId
+	}
+	return usageLogResponse{
+		ID: ref.ID, TenantKey: ref.TenantKey, UserID: ref.UserID, RequestID: requestID, NovaRequestID: ref.NovaRequestID,
+		ModelType: modelType, Log: log, QuotaData: quota, Other: extra,
+	}, nil
+}
+
+func channelNameByID(channelID int) string {
+	if channelID == 0 || model.DB == nil {
+		return ""
+	}
+	var channel struct {
+		Name string
+	}
+	if err := model.DB.Table("channels").Select("name").Where("id = ?", channelID).Take(&channel).Error; err != nil {
+		return ""
+	}
+	return channel.Name
 }
 
 func loadTenant(tenantKey string) (*Tenant, *model.User, error) {
@@ -1016,7 +1245,7 @@ func buildTenantDetail(tenant Tenant, user model.User) (tenantResponse, error) {
 	_, db := currentState()
 	lastActive := user.LastLoginAt
 	var lastUsage int64
-	if err := db.Model(&UsageEvent{}).Select("COALESCE(MAX(occurred_at), 0)").Where("tenant_id = ?", tenant.ID).Scan(&lastUsage).Error; err != nil {
+	if err := db.Model(&LogRef{}).Select("COALESCE(MAX(occurred_at), 0)").Where("tenant_key = ?", user.Username).Scan(&lastUsage).Error; err != nil {
 		return tenantResponse{}, err
 	}
 	if lastUsage > lastActive {
@@ -1107,10 +1336,6 @@ func writeIdempotentResponse(c *gin.Context, response idempotentResponse, err er
 
 func successBody(data any) gin.H {
 	return gin.H{"success": true, "message": "ok", "data": data}
-}
-
-func successListBody(data any, page, pageSize int, total int64) gin.H {
-	return gin.H{"success": true, "message": "ok", "data": data, "page": page, "page_size": pageSize, "total": total}
 }
 
 func writeAPIError(c *gin.Context, err error) {

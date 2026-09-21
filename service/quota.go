@@ -243,7 +243,7 @@ func PostWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, mod
 		InjectTieredBillingInfo(other, relayInfo, tieredResult)
 	}
 	attachQuotaSaturation(ctx, relayInfo, other)
-	model.RecordConsumeLog(ctx, relayInfo.UserId, model.RecordConsumeLogParams{
+	consumeLog := model.RecordConsumeLog(ctx, relayInfo.UserId, model.RecordConsumeLogParams{
 		ChannelId:        relayInfo.ChannelId,
 		PromptTokens:     usage.InputTokens,
 		CompletionTokens: usage.OutputTokens,
@@ -258,7 +258,11 @@ func PostWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, mod
 		Other:            other,
 	})
 	if settled {
-		RecordRelayFinalizedUsage(ctx, relayInfo, quota, usage.InputTokens, usage.OutputTokens)
+		logID := 0
+		if consumeLog != nil {
+			logID = consumeLog.Id
+		}
+		RecordRelayFinalizedUsage(ctx, relayInfo, quota, logID)
 	}
 }
 
@@ -382,7 +386,7 @@ func PostAudioConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, u
 		InjectTieredBillingInfo(other, relayInfo, tieredResult)
 	}
 	attachQuotaSaturation(ctx, relayInfo, other)
-	model.RecordConsumeLog(ctx, relayInfo.UserId, model.RecordConsumeLogParams{
+	consumeLog := model.RecordConsumeLog(ctx, relayInfo.UserId, model.RecordConsumeLogParams{
 		ChannelId:        relayInfo.ChannelId,
 		PromptTokens:     usage.PromptTokens,
 		CompletionTokens: usage.CompletionTokens,
@@ -397,7 +401,11 @@ func PostAudioConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, u
 		Other:            other,
 	})
 	if settled {
-		RecordRelayFinalizedUsage(ctx, relayInfo, quota, usage.PromptTokens, usage.CompletionTokens)
+		logID := 0
+		if consumeLog != nil {
+			logID = consumeLog.Id
+		}
+		RecordRelayFinalizedUsage(ctx, relayInfo, quota, logID)
 	}
 	relayInfo.PerformanceOutputTokens = int64(usage.CompletionTokens)
 }

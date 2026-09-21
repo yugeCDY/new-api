@@ -91,23 +91,23 @@ func runPublisher(ctx context.Context, done chan struct{}, config Config, db *go
 }
 
 func reconcileMissingOutbox(db *gorm.DB, config Config, now time.Time) error {
-	var events []UsageEvent
-	if err := db.Table("nova_usage_events").
-		Select("nova_usage_events.*").
-		Joins("LEFT JOIN nova_outbox ON nova_outbox.event_id = nova_usage_events.event_id").
+	var refs []LogRef
+	if err := db.Table("nova_log_ref").
+		Select("nova_log_ref.*").
+		Joins("LEFT JOIN nova_outbox ON nova_outbox.event_id = nova_log_ref.event_id").
 		Where("nova_outbox.id IS NULL").
-		Order("nova_usage_events.id ASC").
+		Order("nova_log_ref.id ASC").
 		Limit(config.BatchSize).
-		Find(&events).Error; err != nil {
+		Find(&refs).Error; err != nil {
 		return err
 	}
-	for _, event := range events {
-		payload, err := marshalUsageMessage(event)
+	for _, ref := range refs {
+		payload, err := marshalUsageMessage(ref)
 		if err != nil {
 			return err
 		}
 		outbox := Outbox{
-			EventID: event.EventID, ExchangeName: config.Exchange, RoutingKey: config.RoutingKey,
+			EventID: ref.EventID, ExchangeName: config.Exchange, RoutingKey: config.RoutingKey,
 			Payload: string(payload), Status: "pending", NextAttemptAt: now.Unix(),
 			CreatedAt: now.Unix(), UpdatedAt: now.Unix(),
 		}
@@ -141,7 +141,7 @@ func cleanupExpiredRecords(db *gorm.DB, config Config, now time.Time) error {
 		}
 		if config.EventRetention > 0 {
 			eventsBefore := now.Add(-config.EventRetention).Unix()
-			if err := tx.Where("occurred_at < ?", eventsBefore).Delete(&UsageEvent{}).Error; err != nil {
+			if err := tx.Where("occurred_at < ?", eventsBefore).Delete(&LogRef{}).Error; err != nil {
 				return err
 			}
 		}

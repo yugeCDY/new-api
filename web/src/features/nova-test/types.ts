@@ -65,24 +65,18 @@ export type NovaRequestResult = {
 }
 
 export type NovaUsageEnvelope = {
+  tenant_key?: string
+  user_id?: number
+  request_id?: string
+  nova_request_id?: string
+  model_type?: string
+  log?: Record<string, unknown>
+  quota_data?: Record<string, unknown>
+  other?: Record<string, unknown>
+  // Legacy envelope fields kept for older queued messages.
   schema_version?: number
   event_id?: string
   event_type?: string
-  occurred_at?: string
-  producer?: string
-  tenant_key?: string
-  source?: {
-    type?: string
-    key?: string
-  }
-  usage?: {
-    quota?: number
-    model?: string
-    prompt_tokens?: number
-    completion_tokens?: number
-    total_tokens?: number
-  }
-  context?: Record<string, unknown>
   [key: string]: unknown
 }
 

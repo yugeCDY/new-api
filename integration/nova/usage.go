@@ -31,20 +31,18 @@ func recordAttribution(event service.UsageLifecycleEvent) error {
 		return errors.New("verified usage attribution does not match token ownership")
 	}
 	return db.Clauses(clause.OnConflict{DoNothing: true}).Create(&Attribution{
-		SourceType:    event.SourceType,
-		SourceKey:     event.SourceKey,
-		TenantID:      tenant.ID,
-		TenantKey:     username,
-		UserID:        event.UserID,
-		TokenID:       event.TokenID,
-		NovaRequestID: event.Attribution.RequestID,
-		CreatedAt:     time.Now().Unix(),
+		SourceType: event.SourceType, SourceKey: event.SourceKey, TenantID: tenant.ID,
+		TenantKey: username, UserID: event.UserID, TokenID: event.TokenID,
+		NovaRequestID: event.Attribution.RequestID, CreatedAt: time.Now().Unix(),
 	}).Error
 }
 
 func recordFinalizedUsage(event service.UsageLifecycleEvent) error {
 	if event.Quota < 0 || event.SourceKey == "" {
 		return errors.New("invalid finalized usage event")
+	}
+	if event.LogID <= 0 {
+		return nil
 	}
 	config, db := currentState()
 	if !config.Enabled || db == nil {
@@ -57,8 +55,10 @@ func recordFinalizedUsage(event service.UsageLifecycleEvent) error {
 	if err != nil {
 		return err
 	}
-
 	novaRequestID := ""
+	if event.Attribution != nil {
+		novaRequestID = event.Attribution.RequestID
+	}
 	if event.SourceType == "task" {
 		var attribution Attribution
 		if err := db.Where("source_type = ? AND source_key = ?", event.SourceType, event.SourceKey).First(&attribution).Error; err != nil {
@@ -71,47 +71,35 @@ func recordFinalizedUsage(event service.UsageLifecycleEvent) error {
 			return errors.New("task attribution does not match token ownership")
 		}
 		novaRequestID = attribution.NovaRequestID
-	} else {
-		if event.Attribution == nil || !event.Attribution.Verified || event.Attribution.Provider != "nova" || event.Attribution.Subject != username {
-			return nil
-		}
-		novaRequestID = event.Attribution.RequestID
+	} else if event.Attribution == nil || !event.Attribution.Verified || event.Attribution.Provider != "nova" || event.Attribution.Subject != username {
+		return nil
 	}
-
+	log, err := consumeLogByID(event.LogID)
+	if err != nil {
+		return err
+	}
+	if log.UserId != event.UserID || log.TokenId != event.TokenID {
+		return errors.New("consume log does not match usage ownership")
+	}
 	now := time.Now().Unix()
 	if event.OccurredAt == 0 {
 		event.OccurredAt = now
 	}
-	eventID := uuid.NewString()
-	usage := UsageEvent{
-		EventID:          eventID,
-		SourceType:       event.SourceType,
-		SourceKey:        event.SourceKey,
-		TenantID:         tenant.ID,
-		TenantKey:        username,
-		UserID:           event.UserID,
-		TokenID:          event.TokenID,
-		TokenName:        event.TokenName,
-		RequestID:        event.RequestID,
-		NovaRequestID:    novaRequestID,
-		ModelName:        event.ModelName,
-		UpstreamModel:    event.UpstreamModel,
-		ChannelID:        event.ChannelID,
-		GroupName:        event.GroupName,
-		Quota:            event.Quota,
-		PromptTokens:     event.PromptTokens,
-		CompletionTokens: event.CompletionTokens,
-		TotalTokens:      event.TotalTokens,
-		OccurredAt:       event.OccurredAt,
-		CreatedAt:        now,
+	requestID := event.RequestID
+	if requestID == "" {
+		requestID = log.RequestId
 	}
-	payload, err := marshalUsageMessage(usage)
+	ref := LogRef{EventID: uuid.NewString(), SourceType: event.SourceType, SourceKey: event.SourceKey,
+		TenantKey: username, UserID: event.UserID, TokenID: event.TokenID, RequestID: requestID,
+		NovaRequestID: novaRequestID, LogID: event.LogID, OccurredAt: event.OccurredAt, CreatedAt: now}
+	payload, err := marshalUsageMessage(ref)
 	if err != nil {
 		return err
 	}
-	outbox := Outbox{EventID: eventID, ExchangeName: config.Exchange, RoutingKey: config.RoutingKey, Payload: string(payload), Status: "pending", NextAttemptAt: now, CreatedAt: now, UpdatedAt: now}
-	err = db.Transaction(func(tx *gorm.DB) error {
-		created := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&usage)
+	outbox := Outbox{EventID: ref.EventID, ExchangeName: config.Exchange, RoutingKey: config.RoutingKey,
+		Payload: string(payload), Status: "pending", NextAttemptAt: now, CreatedAt: now, UpdatedAt: now}
+	return db.Transaction(func(tx *gorm.DB) error {
+		created := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&ref)
 		if created.Error != nil {
 			return created.Error
 		}
@@ -122,53 +110,25 @@ func recordFinalizedUsage(event service.UsageLifecycleEvent) error {
 		}
 		return tx.Where("source_type = ? AND source_key = ?", event.SourceType, event.SourceKey).Delete(&Attribution{}).Error
 	})
-	return err
 }
 
-func marshalUsageMessage(event UsageEvent) ([]byte, error) {
-	usagePayload := map[string]any{"quota": event.Quota}
-	if event.ModelName != "" {
-		usagePayload["model"] = event.ModelName
+func consumeLogByID(logID int) (*model.Log, error) {
+	if model.LOG_DB == nil {
+		return nil, errors.New("log database is not configured")
 	}
-	if event.PromptTokens != 0 {
-		usagePayload["prompt_tokens"] = event.PromptTokens
+	var log model.Log
+	if err := model.LOG_DB.Where("id = ? AND type = ?", logID, model.LogTypeConsume).First(&log).Error; err != nil {
+		return nil, err
 	}
-	if event.CompletionTokens != 0 {
-		usagePayload["completion_tokens"] = event.CompletionTokens
+	return &log, nil
+}
+
+func marshalUsageMessage(ref LogRef) ([]byte, error) {
+	item, err := usageLogRefResponse(ref)
+	if err != nil {
+		return nil, err
 	}
-	if event.TotalTokens != 0 {
-		usagePayload["total_tokens"] = event.TotalTokens
-	}
-	messageContext := map[string]any{"token_id": event.TokenID}
-	if event.RequestID != "" {
-		messageContext["request_id"] = event.RequestID
-	}
-	if event.NovaRequestID != "" {
-		messageContext["nova_request_id"] = event.NovaRequestID
-	}
-	if event.TokenName != "" {
-		messageContext["token_name"] = event.TokenName
-	}
-	if event.ChannelID != 0 {
-		messageContext["channel_id"] = event.ChannelID
-	}
-	if event.GroupName != "" {
-		messageContext["group"] = event.GroupName
-	}
-	return common.Marshal(map[string]any{
-		"schema_version": 1,
-		"event_id":       event.EventID,
-		"event_type":     "nova.usage.reported",
-		"occurred_at":    time.Unix(event.OccurredAt, 0).UTC().Format(time.RFC3339),
-		"producer":       "new-api",
-		"tenant_key":     event.TenantKey,
-		"source": map[string]any{
-			"type": event.SourceType,
-			"key":  event.SourceKey,
-		},
-		"usage":   usagePayload,
-		"context": messageContext,
-	})
+	return common.Marshal(item)
 }
 
 func resolveTenantOwnership(db *gorm.DB, userID, tokenID int) (*Tenant, string, error) {

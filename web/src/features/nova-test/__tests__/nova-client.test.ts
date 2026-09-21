@@ -160,9 +160,12 @@ describe('RabbitMQ message consumption', () => {
     const responseBody = JSON.stringify([
       {
         payload: JSON.stringify({
-          schema_version: 1,
-          event_id: 'event-1',
-          event_type: 'nova.usage.reported',
+          tenant_key: 'nova-test-3',
+          request_id: 'request-1',
+          nova_request_id: 'nova-request-1',
+          model_type: 'text',
+          log: { model_name: 'deepseek-r1', use_time: 0 },
+          quota_data: { quota: 42 },
         }),
         routing_key: 'nova.usage.reported',
         properties: { message_id: 'event-1' },
