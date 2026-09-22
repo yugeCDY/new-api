@@ -85,7 +85,7 @@ Nova 平台                          New-API
 
 仓库提供可直接导入 Postman 的 Collection 和 Environment，适合在接入、排障时逐个调用 Nova HTTP 接口：
 
-- [Nova Integration Lab Collection](postman/Nova-Integration-Lab.postman_collection.json)：包含全部 15 个管理 API 和 1 个模型调用 API；在请求发送前自动生成 `X-Nova-Timestamp`、`X-Nova-Nonce`、请求标识，并使用 Web Crypto 计算 `X-Nova-Signature`。
+- [Nova Integration Lab Collection](postman/Nova-Integration-Lab.postman_collection.json)：包含全部 15 个管理 API，以及对话、图片、视频生成 / 内容获取共 4 个模型调用 API；在请求发送前自动生成 `X-Nova-Timestamp`、`X-Nova-Nonce`、请求标识，并使用 Web Crypto 计算 `X-Nova-Signature`。
 - [Nova Integration Lab Environment](postman/Nova-Integration-Lab.postman_environment.json)：仅预置 `nova_base_url` 为本机地址，其余变量均为空，避免导入环境携带凭据或业务租户信息。
 
 导入两个文件并选择该环境后，填写以下环境变量的**当前值**：
@@ -98,7 +98,10 @@ Nova 平台                          New-API
 | `tenant_key` | 租户及模型请求 | Nova 租户标识；创建租户前自行指定 |
 | `token_name` | 令牌额度 / 吊销 | 对应的令牌名称；轮换成功后由 Collection 自动更新为响应中的新名称 |
 | `api_token` | 模型请求 | Nova 租户 Token；「创建租户」和「轮换主令牌」成功后会自动更新 |
-| `model` | 模型请求 | 要调用的模型名称 |
+| `model` | 对话接口 | 要调用的对话模型名称 |
+| `image_model` | 图片生成接口 | 已配置的图片模型名称 |
+| `video_model` | 视频生成接口 | 已配置的视频模型名称 |
+| `video_task_id` | 获取视频内容接口 | 视频生成响应中的任务 ID；Collection 会自动保存 |
 
 Collection 不包含 RabbitMQ Management API 操作；RabbitMQ 消费端请按第 6 节使用 AMQP 客户端自行声明队列、绑定 Exchange 并消费消息。签名规则仍以第 2 节为准。
 
@@ -837,7 +840,7 @@ X-Nova-Signature: <HMAC-SHA256 hex>
 | `quota` | int | 本次扣费配额数 |
 | `created_time` | string | 与 `log.created_at` 同一时刻，RFC3339（UTC） |
 | `deducted_amount_usd` | number | 折算美元 = `quota / QuotaPerUnit`；`QuotaPerUnit` 为部署配置，默认 `500000`（对应 $0.002/1K tokens） |
-| `expr` | string | 本次计费所依据的计费表达式（服务端以 base64 存储，此处为解码后原文），便于对账（存在才返回） |
+| `expr` | string | 本次计费所依据的计费表达式（服务端以 base64 存储，此处为解码后原文），便于对账（存在才返回）。表达式变量、函数和换算规则见[计费表达式文档](../../../pkg/billingexpr/expr.md) |
 | `billing_mode` | string | 计费模式；当前取值为 **`tiered_expr`**（表达式 / 分档计费） |
 | `billing_source` | string | 扣费来源，**枚举：`wallet` 钱包 / `subscription` 订阅** |
 | `billing_preference` | string | 用户计费偏好（存在才返回） |

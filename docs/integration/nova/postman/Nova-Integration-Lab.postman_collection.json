@@ -408,6 +408,73 @@
             "url": "{{nova_base_url}}/v1/chat/completions",
             "description": "Calls the selected model and produces a Nova usage event after settlement."
           }
+        },
+        {
+          "name": "图片生成",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Accept", "value": "application/json" },
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{api_token}}", "type": "text" },
+              { "key": "X-Nova-Tenant-Key", "value": "{{tenant_key}}", "type": "text" },
+              { "key": "X-Nova-Request-Id", "value": "{{nova_request_id}}", "type": "text" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"{{image_model}}\",\n  \"prompt\": \"一只戴着宇航员头盔的橘猫，电影感，高清\",\n  \"size\": \"1024x1024\",\n  \"n\": 1,\n  \"response_format\": \"url\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{nova_base_url}}/v1/images/generations",
+            "description": "通过 Nova 归属和 HMAC 签名调用 OpenAI 兼容图片生成接口；请填写已配置的图片模型名称。"
+          }
+        },
+        {
+          "name": "视频生成",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code >= 200 && pm.response.code < 300) {",
+                  "  const payload = pm.response.json();",
+                  "  const taskId = payload.id || (payload.data && payload.data.id);",
+                  "  if (taskId) pm.environment.set('video_task_id', taskId);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Accept", "value": "application/json" },
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{api_token}}", "type": "text" },
+              { "key": "X-Nova-Tenant-Key", "value": "{{tenant_key}}", "type": "text" },
+              { "key": "X-Nova-Request-Id", "value": "{{nova_request_id}}", "type": "text" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"{{video_model}}\",\n  \"prompt\": \"一艘飞船掠过云层，电影感航拍镜头\",\n  \"seconds\": \"5\",\n  \"size\": \"1280x720\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{nova_base_url}}/v1/videos",
+            "description": "通过 Nova 归属和 HMAC 签名提交 OpenAI 兼容视频生成任务；请填写已配置的视频模型名称。"
+          }
+        },
+        {
+          "name": "获取视频内容",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "video/*" },
+              { "key": "Authorization", "value": "Bearer {{api_token}}", "type": "text" }
+            ],
+            "url": "{{nova_base_url}}/v1/videos/{{video_task_id}}/content",
+            "description": "视频任务完成后下载最终视频内容。视频生成请求成功时会自动把响应中的 id 保存为 video_task_id；在 Postman 中可使用 Send and Download 保存文件。"
+          }
         }
       ]
     }
