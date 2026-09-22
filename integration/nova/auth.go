@@ -53,6 +53,7 @@ func HMACAuth() gin.HandlerFunc {
 
 		c.Set("nova_authenticated", true)
 		c.Next()
+		recordManagementAudit(c)
 	}
 }
 
@@ -215,5 +216,6 @@ func calculateSignature(secret []byte, canonical string) []byte {
 func rejectAuthentication(c *gin.Context, reason string) {
 	logger.LogWarn(c, fmt.Sprintf("Nova service authentication rejected: %s", reason))
 	c.Header("Cache-Control", "no-store")
+	recordAuthenticationFailure(c)
 	c.AbortWithStatusJSON(http.StatusUnauthorized, failureBody(c, "nova_authentication_failed", "service authentication failed"))
 }

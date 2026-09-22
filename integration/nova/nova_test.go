@@ -539,6 +539,7 @@ func TestHMACAuthenticationRejectsInvalidRequests(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			db := openTestDatabase(t)
+			require.NoError(t, db.AutoMigrate(&model.AuditLog{}))
 			require.NoError(t, migrate(db))
 			setTestRuntime(t, db, secret)
 			router := gin.New()
@@ -555,6 +556,15 @@ func TestHMACAuthenticationRejectsInvalidRequests(t *testing.T) {
 			assert.Equal(t, http.StatusUnauthorized, response.Code)
 			assert.Contains(t, response.Body.String(), "nova_authentication_failed")
 			assert.NotContains(t, response.Body.String(), test.name)
+			var audit model.AuditLog
+			require.NoError(t, db.Where("action = ?", "nova.authentication.failed").First(&audit).Error)
+			assert.Equal(t, model.AuditCategorySecurity, audit.Category)
+			assert.False(t, audit.Success)
+			assert.NotContains(t, audit.Content, test.timestamp)
+			auditData, err := common.Marshal(audit)
+			require.NoError(t, err)
+			assert.NotContains(t, string(auditData), test.nonce)
+			assert.NotContains(t, string(auditData), request.Header.Get(headerSignature))
 		})
 	}
 }
@@ -605,6 +615,7 @@ func TestTenantCreationReturnsSecretOnceAndQuotaIsIdempotent(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	db := openTestDatabase(t)
 	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}))
+	require.NoError(t, db.AutoMigrate(&model.AuditLog{}))
 	require.NoError(t, migrate(db))
 	secret := bytes.Repeat([]byte{0x35}, 32)
 	setTestRuntime(t, db, secret)
@@ -764,7 +775,7 @@ func TestTenantCreationReturnsSecretOnceAndQuotaIsIdempotent(t *testing.T) {
 	require.Equal(t, http.StatusOK, disableResponse.Code, disableResponse.Body.String())
 	var enabledTokens int64
 	require.NoError(t, db.Model(&model.Token{}).Where("user_id = ? AND status = ?", user.Id, common.TokenStatusEnabled).Count(&enabledTokens).Error)
-	assert.Zero(t, enabledTokens)
+	assert.EqualValues(t, 1, enabledTokens, "disabling a tenant must preserve token status")
 
 	enableBody := []byte(`{"request_id":"enable-tenant-a"}`)
 	enable := signedRequest(t, secret, http.MethodPost, "/api/novapay/tenant/tenant-a/enable", strconvUnix(time.Now()), "enabletenantnoncevalue1", enableBody, enableBody)
@@ -772,7 +783,7 @@ func TestTenantCreationReturnsSecretOnceAndQuotaIsIdempotent(t *testing.T) {
 	router.ServeHTTP(enableResponse, enable)
 	require.Equal(t, http.StatusOK, enableResponse.Code, enableResponse.Body.String())
 	require.NoError(t, db.Model(&model.Token{}).Where("user_id = ? AND status = ?", user.Id, common.TokenStatusEnabled).Count(&enabledTokens).Error)
-	assert.Zero(t, enabledTokens, "enabling a tenant must not reactivate individually disabled tokens")
+	assert.EqualValues(t, 1, enabledTokens, "enabling a tenant must preserve the token status it had before disabling")
 
 	rotateBody := []byte(`{"request_id":"rotate-primary-token","reason":"suspected leak"}`)
 	rotate := signedRequest(t, secret, http.MethodPost, "/api/novapay/tenant/tenant-a/token/rotate", strconvUnix(time.Now()), "rotatetokennoncevalue1", rotateBody, rotateBody)
@@ -780,13 +791,33 @@ func TestTenantCreationReturnsSecretOnceAndQuotaIsIdempotent(t *testing.T) {
 	router.ServeHTTP(rotateResponse, rotate)
 	require.Equal(t, http.StatusOK, rotateResponse.Code, rotateResponse.Body.String())
 	assert.Contains(t, rotateResponse.Body.String(), `"old_token_name":"nova-tenant-a"`)
-	assert.Contains(t, rotateResponse.Body.String(), `"token_name":"nova-tenant-a"`)
 	assert.Contains(t, rotateResponse.Body.String(), `"token_key":"sk-`)
 	assert.Contains(t, rotateResponse.Body.String(), `"message":"ok"`)
 	var rotatePayload map[string]any
 	require.NoError(t, common.Unmarshal(rotateResponse.Body.Bytes(), &rotatePayload))
-	rotatedSecret := rotatePayload["data"].(map[string]any)["token_key"].(string)
+	rotatedData := rotatePayload["data"].(map[string]any)
+	rotatedSecret := rotatedData["token_key"].(string)
+	rotatedName := rotatedData["token_name"].(string)
 	assert.NotEqual(t, tokenSecret, rotatedSecret)
+	assert.NotEqual(t, "nova-tenant-a", rotatedName)
+	assert.True(t, tokenNamePattern.MatchString(rotatedName))
+	assert.True(t, strings.HasPrefix(rotatedName, "nova-tenant-a-"))
+	var rotateAudit model.AuditLog
+	require.NoError(t, db.Where("action = ?", "nova.token.rotate").Order("id DESC").First(&rotateAudit).Error)
+	assert.Equal(t, user.Id, rotateAudit.UserId)
+	assert.Equal(t, "tenant-a", rotateAudit.Username)
+	assert.Equal(t, model.AuditActorRoleService, rotateAudit.ActorRole)
+	assert.Equal(t, model.AuditCategoryOperation, rotateAudit.Category)
+	assert.Equal(t, "nova_hmac", rotateAudit.AuthMethod)
+	assert.True(t, rotateAudit.Success)
+	assert.Contains(t, rotateAudit.Content, "通过 Nova 接口轮换令牌密钥")
+	assert.Contains(t, rotateAudit.Content, "租户：tenant-a")
+	assert.Contains(t, rotateAudit.Content, "原令牌：nova-tenant-a")
+	assert.Contains(t, rotateAudit.Content, "令牌："+rotatedName)
+	assert.NotContains(t, rotateAudit.Content, rotatedSecret)
+	auditData, err := common.Marshal(rotateAudit)
+	require.NoError(t, err)
+	assert.NotContains(t, string(auditData), rotatedSecret)
 
 	rotateReplay := signedRequest(t, secret, http.MethodPost, "/api/novapay/tenant/tenant-a/token/rotate", strconvUnix(time.Now()), "rotatereplaynoncevalue1", rotateBody, rotateBody)
 	rotateReplayResponse := httptest.NewRecorder()
@@ -796,15 +827,16 @@ func TestTenantCreationReturnsSecretOnceAndQuotaIsIdempotent(t *testing.T) {
 	assert.Contains(t, rotateReplayResponse.Body.String(), rotatedSecret)
 
 	tokenQuotaBody := []byte(`{"request_id":"token-set-quota-1","remain_quota":500000,"unlimited_quota":false,"reason":"employee quota"}`)
-	tokenQuota := signedRequest(t, secret, http.MethodPost, "/api/novapay/tenant/tenant-a/tokens/nova-tenant-a/quota", strconvUnix(time.Now()), "tokenquotanoncevalue12", tokenQuotaBody, tokenQuotaBody)
+	tokenQuotaPath := "/api/novapay/tenant/tenant-a/tokens/" + rotatedName + "/quota"
+	tokenQuota := signedRequest(t, secret, http.MethodPost, tokenQuotaPath, strconvUnix(time.Now()), "tokenquotanoncevalue12", tokenQuotaBody, tokenQuotaBody)
 	tokenQuotaResponse := httptest.NewRecorder()
 	router.ServeHTTP(tokenQuotaResponse, tokenQuota)
 	require.Equal(t, http.StatusOK, tokenQuotaResponse.Code, tokenQuotaResponse.Body.String())
-	assert.Contains(t, tokenQuotaResponse.Body.String(), `"token_name":"nova-tenant-a"`)
+	assert.Contains(t, tokenQuotaResponse.Body.String(), `"token_name":"`+rotatedName+`"`)
 	assert.Contains(t, tokenQuotaResponse.Body.String(), `"remain_quota":500000`)
 	assert.Contains(t, tokenQuotaResponse.Body.String(), `"unlimited_quota":false`)
 
-	tokenQuotaReplay := signedRequest(t, secret, http.MethodPost, "/api/novapay/tenant/tenant-a/tokens/nova-tenant-a/quota", strconvUnix(time.Now()), "tokenquotareplaynonce1", tokenQuotaBody, tokenQuotaBody)
+	tokenQuotaReplay := signedRequest(t, secret, http.MethodPost, tokenQuotaPath, strconvUnix(time.Now()), "tokenquotareplaynonce1", tokenQuotaBody, tokenQuotaBody)
 	tokenQuotaReplayResponse := httptest.NewRecorder()
 	router.ServeHTTP(tokenQuotaReplayResponse, tokenQuotaReplay)
 	require.Equal(t, http.StatusOK, tokenQuotaReplayResponse.Code, tokenQuotaReplayResponse.Body.String())
@@ -812,12 +844,13 @@ func TestTenantCreationReturnsSecretOnceAndQuotaIsIdempotent(t *testing.T) {
 	assert.Contains(t, tokenQuotaReplayResponse.Body.String(), `"remain_quota":500000`)
 
 	var rotatedToken model.Token
-	require.NoError(t, db.Where("user_id = ? AND name = ?", user.Id, "nova-tenant-a").First(&rotatedToken).Error)
+	require.NoError(t, db.Where("user_id = ? AND name = ?", user.Id, rotatedName).First(&rotatedToken).Error)
 	assert.Equal(t, 500000, rotatedToken.RemainQuota)
 	assert.False(t, rotatedToken.UnlimitedQuota)
 
 	deleteTokenBody := []byte(`{"request_id":"delete-rotated-token"}`)
-	deleteTokenRequest := signedRequest(t, secret, http.MethodDelete, "/api/novapay/tenant/tenant-a/tokens/nova-tenant-a", strconvUnix(time.Now()), "deletetokennoncevalue1", deleteTokenBody, deleteTokenBody)
+	deleteTokenPath := "/api/novapay/tenant/tenant-a/tokens/" + rotatedName
+	deleteTokenRequest := signedRequest(t, secret, http.MethodDelete, deleteTokenPath, strconvUnix(time.Now()), "deletetokennoncevalue1", deleteTokenBody, deleteTokenBody)
 	deleteTokenResponse := httptest.NewRecorder()
 	router.ServeHTTP(deleteTokenResponse, deleteTokenRequest)
 	require.Equal(t, http.StatusOK, deleteTokenResponse.Code, deleteTokenResponse.Body.String())
@@ -835,6 +868,85 @@ func TestTenantCreationReturnsSecretOnceAndQuotaIsIdempotent(t *testing.T) {
 	assert.Equal(t, http.StatusConflict, reenableDeletedResponse.Code)
 	assert.Contains(t, reenableDeletedResponse.Body.String(), "tenant_deleted")
 	assert.Contains(t, reenableDeletedResponse.Body.String(), `"message":`)
+}
+
+func TestRotateTokenGeneratesNewName(t *testing.T) {
+	testRotateTokenGeneratesNewName(t, openTestDatabase(t))
+}
+
+func TestRotateTokenGeneratesNewNameMySQL(t *testing.T) {
+	dsn := strings.TrimSpace(os.Getenv("TEST_MYSQL_DSN"))
+	if dsn == "" {
+		t.Skip("TEST_MYSQL_DSN is not configured")
+	}
+	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
+	require.NoError(t, err)
+	testRotateTokenGeneratesNewName(t, db)
+}
+
+func TestRotateTokenGeneratesNewNamePostgreSQL(t *testing.T) {
+	dsn := strings.TrimSpace(os.Getenv("TEST_POSTGRES_DSN"))
+	if dsn == "" {
+		t.Skip("TEST_POSTGRES_DSN is not configured")
+	}
+	db, err := gorm.Open(postgres.New(postgres.Config{DSN: dsn, PreferSimpleProtocol: true}), &gorm.Config{})
+	require.NoError(t, err)
+	testRotateTokenGeneratesNewName(t, db)
+}
+
+func testRotateTokenGeneratesNewName(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}))
+	require.NoError(t, migrate(db))
+
+	secret := bytes.Repeat([]byte{0x63}, 32)
+	setTestRuntime(t, db, secret)
+	previousModelDB := model.DB
+	previousRedisEnabled := common.RedisEnabled
+	model.DB = db
+	common.RedisEnabled = false
+	t.Cleanup(func() {
+		model.DB = previousModelDB
+		common.RedisEnabled = previousRedisEnabled
+	})
+
+	tenantKey := "rotate-" + uuid.NewString()[:8]
+	user := model.User{Username: tenantKey, Password: "unused", Status: common.UserStatusEnabled, Quota: 1000, Group: "default", AffCode: "nova-rotate"}
+	require.NoError(t, db.Create(&user).Error)
+	t.Cleanup(func() {
+		_ = db.Where("user_id = ?", user.Id).Delete(&model.Token{}).Error
+		_ = db.Where("user_id = ?", user.Id).Delete(&Tenant{}).Error
+		_ = db.Delete(&user).Error
+	})
+	require.NoError(t, db.Create(&Tenant{UserID: user.Id, CreatedAt: time.Now().Unix(), UpdatedAt: time.Now().Unix()}).Error)
+	oldName := primaryTokenName(tenantKey)
+	token := model.Token{UserId: user.Id, Key: "rotate-token-" + uuid.NewString(), Name: oldName, Status: common.TokenStatusEnabled, RemainQuota: 1000}
+	require.NoError(t, db.Create(&token).Error)
+
+	router := gin.New()
+	api := router.Group("/api")
+	RegisterRoutes(api)
+	body := []byte(`{"request_id":"rotate-generated-name","reason":"scheduled rotation"}`)
+	nonce := "rotategenerated" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	request := signedRequest(t, secret, http.MethodPost, "/api/novapay/tenant/"+tenantKey+"/token/rotate", strconvUnix(time.Now()), nonce, body, body)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+
+	var payload map[string]any
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &payload))
+	data := payload["data"].(map[string]any)
+	newName := data["token_name"].(string)
+	assert.Equal(t, oldName, data["old_token_name"])
+	assert.NotEqual(t, oldName, newName)
+	assert.True(t, tokenNamePattern.MatchString(newName))
+	assert.True(t, strings.HasPrefix(newName, "nova-"+tenantKey+"-"))
+
+	var stored model.Token
+	require.NoError(t, db.First(&stored, token.Id).Error)
+	assert.Equal(t, newName, stored.Name)
+	assert.NotEqual(t, token.Key, stored.Key)
 }
 
 func TestRelayAttributionRejectsTenantMismatch(t *testing.T) {
@@ -1381,7 +1493,7 @@ func openTestDatabase(t *testing.T) *gorm.DB {
 	dsnName := strings.NewReplacer("/", "_", " ", "_").Replace(t.Name()) + "_" + uuid.NewString()
 	db, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:%s?mode=memory&cache=shared", dsnName)), &gorm.Config{})
 	require.NoError(t, err)
-	require.NoError(t, db.AutoMigrate(&model.Log{}))
+	require.NoError(t, db.AutoMigrate(&model.Log{}, &model.AuditLog{}))
 	previousLogDB := model.LOG_DB
 	model.LOG_DB = db
 	t.Cleanup(func() { model.LOG_DB = previousLogDB })

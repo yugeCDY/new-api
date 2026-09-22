@@ -96,7 +96,7 @@ Nova 平台                          New-API
 | `nova_hmac_secret` | 全部请求 | 部署方交付的 base64url HMAC Secret，解码后至少 32 字节 |
 | `nova_key_id` | 可选 | HMAC Key Id；单密钥部署可留空 |
 | `tenant_key` | 租户及模型请求 | Nova 租户标识；创建租户前自行指定 |
-| `token_name` | 令牌额度 / 吊销 | 对应的令牌名称 |
+| `token_name` | 令牌额度 / 吊销 | 对应的令牌名称；轮换成功后由 Collection 自动更新为响应中的新名称 |
 | `api_token` | 模型请求 | Nova 租户 Token；「创建租户」和「轮换主令牌」成功后会自动更新 |
 | `model` | 模型请求 | 要调用的模型名称 |
 
@@ -167,6 +167,10 @@ signature = hex( HMAC-SHA256( secret_bytes, canonical_string ) )
   "request_id": "xxxxxx"
 }
 ```
+
+### 2.6 安全审计
+
+New-API 会在现有 `audit_logs` 中记录 Nova 的 HMAC 鉴权失败、租户与额度变更、令牌轮换 / 额度调整 / 吊销，以及令牌明文列表访问。能识别 `tenant_key` 的管理操作会归属到对应租户用户；`admin_info` 同时保留实际调用方 `nova-service`，以便区分“被操作租户”和“通过 Nova 接口调用”。事件摘要使用中文，明确标注“通过 Nova 接口”，并包含租户、令牌名称、额度 / 调额单号、HTTP 状态与结果等安全详情。审计事件使用 `nova_hmac` 认证方式和 `nova.*` 动作名；已认证请求还会记录 HMAC Key Id、请求 ID、来源 IP。密钥、签名、nonce、Bearer Token、`token_key` 明文及原始请求体不会写入审计日志。
 
 ---
 
@@ -257,7 +261,7 @@ signature = hex( HMAC-SHA256( secret_bytes, canonical_string ) )
 | `DELETE` | `/api/novapay/tenant/{tenant_key}` | 是 | 软删除租户 |
 | `GET` | `/api/novapay/tenants` | 否 | 分页查询租户列表 |
 | `POST` | `/api/novapay/tenant/{tenant_key}/quota` | 是 | 调整租户额度（增量 / 设定绝对值） |
-| `POST` | `/api/novapay/tenant/{tenant_key}/disable` | 是 | 禁用租户及其全部 Token |
+| `POST` | `/api/novapay/tenant/{tenant_key}/disable` | 是 | 禁用租户用户 |
 | `POST` | `/api/novapay/tenant/{tenant_key}/enable` | 是 | 启用租户 |
 | `POST` | `/api/novapay/tenant/{tenant_key}/token/rotate` | 是 | 轮换主令牌密钥 |
 | `GET` | `/api/novapay/tenant/{tenant_key}/tokens` | 否 | 查询租户全部令牌（含明文 key） |
@@ -500,8 +504,8 @@ signature = hex( HMAC-SHA256( secret_bytes, canonical_string ) )
 
 `POST /api/novapay/tenant/{tenant_key}/disable` 与 `POST /api/novapay/tenant/{tenant_key}/enable`，请求体均为 `{"request_id":"……"}`。
 
-- **禁用**：租户用户与全部令牌置为 `disabled`。
-- **启用**：仅将租户用户恢复为 `enabled`，**不会**恢复曾被单独禁用的令牌。
+- **禁用**：仅将租户用户置为 `disabled`。请求鉴权会校验用户状态，因此租户的全部令牌都会立即无法调用，但各令牌自身的状态不变。
+- **启用**：将租户用户恢复为 `enabled`；此前处于 `enabled` 的令牌会恢复可用，曾被单独禁用、过期或耗尽的令牌仍保持原状态。
 
 响应 `data`：`{"username": "{tenant_key}", "status": "disabled" | "enabled"}`。
 
@@ -516,10 +520,10 @@ signature = hex( HMAC-SHA256( secret_bytes, canonical_string ) )
 | 字段 | 类型 | 含义 |
 |---|---|---|
 | `old_token_name` | string | 被轮换令牌原名称 |
-| `token_name` | string | 令牌名称（不变） |
+| `token_name` | string | 服务端为新密钥自动生成的令牌名称 |
 | `token_key` | string | **新密钥明文**（`sk-……`）；旧密钥立即失效 |
 
-> 轮换不影响令牌名称与额度；新明文仅在首次请求及相同 `request_id` 重放时返回。
+> 每次轮换均会生成新的 `token_name`，格式为 `nova-{tenant_key}-{新密钥前8位}`；额度不受影响。新密钥明文与新名称仅在首次请求及相同 `request_id` 重放时返回。后续令牌额度和吊销接口须使用响应中的新名称。
 
 ### 4.12 令牌列表 `GET /api/novapay/tenant/{tenant_key}/tokens`
 

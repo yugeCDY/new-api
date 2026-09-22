@@ -19,6 +19,7 @@ const (
 	AuditCategorySecurity    = "security"
 	AuditCategoryOperation   = "operation"
 	AuditCategoryAccessToken = "access_token"
+	AuditActorRoleService    = -1
 )
 
 // AuditLog is retained independently of usage logs and their cleanup/TTL policy.
@@ -100,7 +101,7 @@ func RecordAuditLog(c *gin.Context, entry AuditLog) {
 		entry.EventId = common.NewRequestId()
 	}
 	switch entry.ActorRole {
-	case common.RoleCommonUser, common.RoleAdminUser, common.RoleRootUser:
+	case common.RoleCommonUser, common.RoleAdminUser, common.RoleRootUser, AuditActorRoleService:
 	default:
 		logger.LogError(ctx, fmt.Sprintf("audit actor role unavailable (request_id=%s, actor_role=%d)", entry.RequestId, entry.ActorRole))
 		entry.ActorRole = 0 // Unknown actors remain visible to root only.

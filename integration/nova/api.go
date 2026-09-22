@@ -138,6 +138,7 @@ func createTenant(c *gin.Context) {
 		writeAPIError(c, err)
 		return
 	}
+	c.Set("nova_audit_tenant_key", request.TenantKey)
 
 	tokenName := primaryTokenName(request.TenantKey)
 	tokenKey, err := common.GenerateKey()
@@ -334,6 +335,7 @@ func updateTenant(c *gin.Context) {
 		writeAPIError(c, newAPIError(http.StatusBadRequest, "invalid_request", "request_id is invalid"))
 		return
 	}
+	c.Set("nova_audit_params", model.AuditFields{"display_name": displayName})
 	tenantKey := c.Param("tenant_key")
 	response, err := executeIdempotent(c, "update_tenant:"+tenantKey, strings.TrimSpace(request.RequestID), func(tx *gorm.DB) (mutationResult, error) {
 		tenant, user, err := lockTenant(tx, tenantKey)
@@ -382,6 +384,7 @@ func setTenantStatus(c *gin.Context, status string) {
 		writeAPIError(c, newAPIError(http.StatusBadRequest, "invalid_request", "request_id is invalid"))
 		return
 	}
+	c.Set("nova_audit_params", model.AuditFields{"status": status})
 	tenantKey := c.Param("tenant_key")
 	response, err := executeIdempotent(c, "tenant_status:"+status+":"+tenantKey, requestID, func(tx *gorm.DB) (mutationResult, error) {
 		tenant, user, err := lockTenant(tx, tenantKey)
@@ -405,9 +408,6 @@ func setTenantStatus(c *gin.Context, status string) {
 			}
 		case tenantStatusDisabled:
 			if err := tx.Model(&model.User{}).Where("id = ?", tenant.UserID).Update("status", common.UserStatusDisabled).Error; err != nil {
-				return mutationResult{}, err
-			}
-			if err := tx.Model(&model.Token{}).Where("user_id = ?", tenant.UserID).Update("status", common.TokenStatusDisabled).Error; err != nil {
 				return mutationResult{}, err
 			}
 		case tenantStatusDeleted:
@@ -465,6 +465,13 @@ func adjustTenantQuota(c *gin.Context) {
 		writeAPIError(c, err)
 		return
 	}
+	auditParams := model.AuditFields{"order_no": request.OrderNo}
+	if request.AbsoluteQuota != nil {
+		auditParams["absolute_quota"] = *request.AbsoluteQuota
+	} else {
+		auditParams["delta_quota"] = *request.DeltaQuota
+	}
+	c.Set("nova_audit_params", auditParams)
 	tenantKey := c.Param("tenant_key")
 	response, err := executeIdempotent(c, "tenant_quota:"+tenantKey, request.RequestID, func(tx *gorm.DB) (mutationResult, error) {
 		tenant, user, err := lockTenant(tx, tenantKey)
@@ -572,9 +579,12 @@ func rotateToken(c *gin.Context) {
 			return mutationResult{}, err
 		}
 		oldName := token.Name
+		newName := rotatedTokenName(tenantKey, newKey)
+		c.Set("nova_audit_params", model.AuditFields{"old_token_name": oldName, "token_name": newName})
 		now := time.Now().Unix()
 		if err := tx.Model(&token).Updates(map[string]any{
 			"key":           newKey,
+			"name":          newName,
 			"status":        common.TokenStatusEnabled,
 			"accessed_time": now,
 		}).Error; err != nil {
@@ -582,10 +592,10 @@ func rotateToken(c *gin.Context) {
 		}
 		body := successBody(gin.H{
 			"old_token_name": oldName,
-			"token_name":     oldName,
+			"token_name":     newName,
 			"token_key":      "sk-" + newKey,
 		})
-		return mutationResult{FreshResponse: body, StoredResponse: body, ResourceRef: oldName, AfterCommit: func() { _ = model.InvalidateUserTokensCache(tenant.UserID) }}, nil
+		return mutationResult{FreshResponse: body, StoredResponse: body, ResourceRef: newName, AfterCommit: func() { _ = model.InvalidateUserTokensCache(tenant.UserID) }}, nil
 	})
 	writeIdempotentResponse(c, response, err)
 }
@@ -610,6 +620,11 @@ func adjustTokenQuota(c *gin.Context) {
 		writeAPIError(c, err)
 		return
 	}
+	c.Set("nova_audit_params", model.AuditFields{
+		"token_name":      c.Param("token_name"),
+		"remain_quota":    *request.RemainQuota,
+		"unlimited_quota": *request.UnlimitedQuota,
+	})
 	tenantKey := c.Param("tenant_key")
 	tokenName := c.Param("token_name")
 	response, err := executeIdempotent(c, "token_quota:"+tenantKey+":"+tokenName, request.RequestID, func(tx *gorm.DB) (mutationResult, error) {
@@ -659,6 +674,7 @@ func deleteToken(c *gin.Context) {
 	}
 	tenantKey := c.Param("tenant_key")
 	tokenName := c.Param("token_name")
+	c.Set("nova_audit_params", model.AuditFields{"token_name": tokenName})
 	response, err := executeIdempotent(c, "delete_token:"+tenantKey+":"+tokenName, requestID, func(tx *gorm.DB) (mutationResult, error) {
 		tenant, user, err := lockTenant(tx, tenantKey)
 		if err != nil {
@@ -1208,6 +1224,14 @@ func pagination(c *gin.Context) (int, int, error) {
 
 func primaryTokenName(tenantKey string) string {
 	name := "nova-" + tenantKey
+	if len(name) > 50 {
+		name = name[:50]
+	}
+	return name
+}
+
+func rotatedTokenName(tenantKey, key string) string {
+	name := "nova-" + tenantKey + "-" + key[:8]
 	if len(name) > 50 {
 		name = name[:50]
 	}

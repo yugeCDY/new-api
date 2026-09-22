@@ -1,13 +1,13 @@
 {
   "info": {
     "_postman_id": "8e5666d6-1b02-4c87-bc41-e2680fd25cf2",
-    "name": "Nova Integration Lab",
+    "name": "Nova 集成实验室",
     "description": "All Nova HTTP calls exposed by the Nova integration lab. Import the matching environment, fill nova_hmac_secret, and select it before sending requests. Nova requests are signed automatically with HMAC-SHA256. The Create tenant and Rotate tenant key requests save returned token_key/token_name values into the active environment.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "item": [
     {
-      "name": "Nova management API",
+      "name": "Nova 管理接口",
       "description": "Management calls under /api/novapay. Every request inherits the folder-level Nova HMAC pre-request script.",
       "event": [
         {
@@ -102,7 +102,7 @@
       ],
       "item": [
         {
-          "name": "Health check",
+          "name": "健康检查",
           "request": {
             "method": "GET",
             "header": [{ "key": "Accept", "value": "application/json" }],
@@ -111,7 +111,7 @@
           }
         },
         {
-          "name": "Model catalog",
+          "name": "模型目录",
           "request": {
             "method": "GET",
             "header": [{ "key": "Accept", "value": "application/json" }],
@@ -120,7 +120,7 @@
           }
         },
         {
-          "name": "List tenants",
+          "name": "租户列表",
           "request": {
             "method": "GET",
             "header": [{ "key": "Accept", "value": "application/json" }],
@@ -129,7 +129,7 @@
           }
         },
         {
-          "name": "Create tenant",
+          "name": "创建租户",
           "event": [
             {
               "listen": "test",
@@ -161,7 +161,7 @@
           }
         },
         {
-          "name": "Get tenant",
+          "name": "查询租户",
           "request": {
             "method": "GET",
             "header": [{ "key": "Accept", "value": "application/json" }],
@@ -170,7 +170,7 @@
           }
         },
         {
-          "name": "Update tenant",
+          "name": "更新租户信息",
           "request": {
             "method": "PUT",
             "header": [
@@ -187,7 +187,7 @@
           }
         },
         {
-          "name": "Adjust tenant quota",
+          "name": "调整租户额度",
           "request": {
             "method": "POST",
             "header": [
@@ -204,7 +204,7 @@
           }
         },
         {
-          "name": "Disable tenant",
+          "name": "禁用租户",
           "request": {
             "method": "POST",
             "header": [
@@ -221,7 +221,7 @@
           }
         },
         {
-          "name": "Enable tenant",
+          "name": "启用租户",
           "request": {
             "method": "POST",
             "header": [
@@ -238,7 +238,7 @@
           }
         },
         {
-          "name": "Rotate tenant key",
+          "name": "轮换租户令牌",
           "event": [
             {
               "listen": "test",
@@ -266,11 +266,11 @@
               "options": { "raw": { "language": "json" } }
             },
             "url": "{{nova_base_url}}/api/novapay/tenant/{{tenant_key}}/token/rotate",
-            "description": "Rotates the primary token secret, saves the new token into the environment, and invalidates the old secret immediately."
+            "description": "Rotates the primary token secret, saves its new key and server-generated name into the environment, and invalidates the old secret immediately."
           }
         },
         {
-          "name": "Query tenant keys",
+          "name": "查询租户令牌",
           "request": {
             "method": "GET",
             "header": [{ "key": "Accept", "value": "application/json" }],
@@ -279,7 +279,7 @@
           }
         },
         {
-          "name": "Set token quota",
+          "name": "设置令牌额度",
           "request": {
             "method": "POST",
             "header": [
@@ -296,7 +296,7 @@
           }
         },
         {
-          "name": "Revoke token",
+          "name": "吊销令牌",
           "request": {
             "method": "DELETE",
             "header": [
@@ -313,7 +313,7 @@
           }
         },
         {
-          "name": "Usage ledger",
+          "name": "用量账本",
           "request": {
             "method": "GET",
             "header": [{ "key": "Accept", "value": "application/json" }],
@@ -322,7 +322,7 @@
           }
         },
         {
-          "name": "Soft-delete tenant",
+          "name": "删除租户",
           "request": {
             "method": "DELETE",
             "header": [
@@ -341,7 +341,7 @@
       ]
     },
     {
-      "name": "Nova model API",
+      "name": "Nova 模型调用接口",
       "description": "Model relay request using Bearer authentication plus Nova attribution. It inherits the same HMAC signing implementation as the management folder.",
       "event": [
         {
@@ -390,7 +390,7 @@
       ],
       "item": [
         {
-          "name": "Chat completion and usage message",
+          "name": "对话接口",
           "request": {
             "method": "POST",
             "header": [
