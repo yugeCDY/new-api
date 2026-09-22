@@ -11,6 +11,17 @@
 | 幂等去重键 | AMQP `Message-Id`（= 账本 `id` 的十进制字符串） |
 | 交付语义 | **at-least-once**（重复投递由消费端按去重键去重） |
 
+### 额度与美元换算
+
+系统内部扣费使用 `quota`；美元金额按部署配置 `QuotaPerUnit` 换算：
+
+```text
+美元金额 = quota / QuotaPerUnit
+quota = 美元金额 × QuotaPerUnit
+```
+
+默认 `QuotaPerUnit = 500000`，即 `500000 quota = $1`、`1000 quota = $0.002`。账本和 RabbitMQ 消息的 `quota_data.deducted_amount_usd` 使用同一公式。
+
 ---
 
 ## 1. 概述
