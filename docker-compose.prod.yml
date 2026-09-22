@@ -83,6 +83,8 @@ services:
       RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
     volumes:
       - rabbitmq_data:/var/lib/rabbitmq
+    ports:
+      - "15672:15672"
     networks:
       - new-api-network
     healthcheck:
