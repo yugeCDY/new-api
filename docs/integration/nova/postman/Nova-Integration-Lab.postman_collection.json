@@ -1,0 +1,415 @@
+{
+  "info": {
+    "_postman_id": "8e5666d6-1b02-4c87-bc41-e2680fd25cf2",
+    "name": "Nova Integration Lab",
+    "description": "All Nova HTTP calls exposed by the Nova integration lab. Import the matching environment, fill nova_hmac_secret, and select it before sending requests. Nova requests are signed automatically with HMAC-SHA256. The Create tenant and Rotate tenant key requests save returned token_key/token_name values into the active environment.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Nova management API",
+      "description": "Management calls under /api/novapay. Every request inherits the folder-level Nova HMAC pre-request script.",
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const textEncoder = new TextEncoder();",
+              "",
+              "function bytesToHex(bytes) {",
+              "  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');",
+              "}",
+              "",
+              "function formEncode(value) {",
+              "  return encodeURIComponent(value)",
+              "    .replace(/%20/g, '+')",
+              "    .replace(/[!'()*]/g, (character) =>", 
+              "      '%' + character.charCodeAt(0).toString(16).toUpperCase()",
+              "    );",
+              "}",
+              "",
+              "function canonicalQuery() {",
+              "  const entries = pm.request.url.query.all()",
+              "    .filter((parameter) => !parameter.disabled)",
+              "    .map((parameter) => [",
+              "      pm.variables.replaceIn(parameter.key || ''),",
+              "      pm.variables.replaceIn(parameter.value || '')",
+              "    ]);",
+              "  entries.sort((left, right) => {",
+              "    if (left[0] !== right[0]) return left[0] < right[0] ? -1 : 1;",
+              "    if (left[1] === right[1]) return 0;",
+              "    return left[1] < right[1] ? -1 : 1;",
+              "  });",
+              "  return entries.map(([key, value]) =>",
+              "    formEncode(key) + '=' + formEncode(value)",
+              "  ).join('&');",
+              "}",
+              "",
+              "function requestPath() {",
+              "  const resolvedUrl = pm.variables.replaceIn(pm.request.url.toString());",
+              "  const match = resolvedUrl.match(/^[a-z][a-z0-9+.-]*:\\/\\/[^/]*(\\/[^?#]*)?/i);",
+              "  return match && match[1] ? match[1] : '/';",
+              "}",
+              "",
+              "function decodeBase64Url(value) {",
+              "  let normalized = value.trim().replace(/-/g, '+').replace(/_/g, '/');",
+              "  normalized += '='.repeat((4 - normalized.length % 4) % 4);",
+              "  return Uint8Array.from(atob(normalized), (character) => character.charCodeAt(0));",
+              "}",
+              "",
+              "const secretValue = pm.environment.get('nova_hmac_secret') || '';",
+              "const secret = decodeBase64Url(secretValue);",
+              "if (secret.byteLength < 32) {",
+              "  throw new Error('nova_hmac_secret must be base64url and decode to at least 32 bytes');",
+              "}",
+              "",
+              "const timestamp = Math.floor(Date.now() / 1000).toString();",
+              "const nonce = pm.variables.replaceIn('{{$guid}}');",
+              "const requestId = 'nova-postman-' + pm.variables.replaceIn('{{$guid}}');",
+              "pm.variables.set('request_id', requestId);",
+              "pm.variables.set('order_no', requestId);",
+              "pm.variables.set('nova_request_id', requestId);",
+              "",
+              "const body = pm.request.body && pm.request.body.mode === 'raw'",
+              "  ? pm.variables.replaceIn(pm.request.body.raw || '')",
+              "  : '';",
+              "const bodyHash = bytesToHex(new Uint8Array(await crypto.subtle.digest('SHA-256', textEncoder.encode(body))));",
+              "const canonical = [",
+              "  pm.request.method.toUpperCase(),",
+              "  requestPath(),",
+              "  canonicalQuery(),",
+              "  timestamp,",
+              "  nonce,",
+              "  bodyHash",
+              "].join('\\n');",
+              "const key = await crypto.subtle.importKey('raw', secret, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);",
+              "const signature = bytesToHex(new Uint8Array(await crypto.subtle.sign('HMAC', key, textEncoder.encode(canonical))));",
+              "",
+              "const keyId = (pm.environment.get('nova_key_id') || '').trim();",
+              "if (keyId) {",
+              "  pm.request.headers.upsert({ key: 'X-Nova-Key-Id', value: keyId });",
+              "} else {",
+              "  pm.request.headers.remove('X-Nova-Key-Id');",
+              "}",
+              "pm.request.headers.upsert({ key: 'X-Nova-Timestamp', value: timestamp });",
+              "pm.request.headers.upsert({ key: 'X-Nova-Nonce', value: nonce });",
+              "pm.request.headers.upsert({ key: 'X-Nova-Signature', value: signature });",
+              "console.log('Nova canonical request:\\n' + canonical);"
+            ]
+          }
+        }
+      ],
+      "item": [
+        {
+          "name": "Health check",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Accept", "value": "application/json" }],
+            "url": "{{nova_base_url}}/api/novapay/health",
+            "description": "Checks the Nova module, database, outbox, and RabbitMQ status."
+          }
+        },
+        {
+          "name": "Model catalog",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Accept", "value": "application/json" }],
+            "url": "{{nova_base_url}}/api/novapay/models",
+            "description": "Reads models and Nova pricing information available to tenants."
+          }
+        },
+        {
+          "name": "List tenants",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Accept", "value": "application/json" }],
+            "url": "{{nova_base_url}}/api/novapay/tenants?page=1&page_size=20",
+            "description": "Lists Nova tenants with pagination and an optional status filter."
+          }
+        },
+        {
+          "name": "Create tenant",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code >= 200 && pm.response.code < 300) {",
+                  "  const payload = pm.response.json();",
+                  "  if (payload.data && payload.data.token_key) pm.environment.set('api_token', payload.data.token_key);",
+                  "  if (payload.data && payload.data.token_name) pm.environment.set('token_name', payload.data.token_name);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Accept", "value": "application/json" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"tenant_key\": \"{{tenant_key}}\",\n  \"tenant_name\": \"Nova Postman Tenant\",\n  \"initial_quota\": 1000000,\n  \"request_id\": \"{{request_id}}\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{nova_base_url}}/api/novapay/tenant",
+            "description": "Creates a tenant account and saves returned token_key/token_name into the active environment."
+          }
+        },
+        {
+          "name": "Get tenant",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Accept", "value": "application/json" }],
+            "url": "{{nova_base_url}}/api/novapay/tenant/{{tenant_key}}",
+            "description": "Reads the current tenant status and remaining quota."
+          }
+        },
+        {
+          "name": "Update tenant",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "Accept", "value": "application/json" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"request_id\": \"{{request_id}}\",\n  \"display_name\": \"Nova Postman Tenant Updated\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{nova_base_url}}/api/novapay/tenant/{{tenant_key}}",
+            "description": "Updates the tenant display name."
+          }
+        },
+        {
+          "name": "Adjust tenant quota",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Accept", "value": "application/json" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"request_id\": \"{{request_id}}\",\n  \"order_no\": \"{{order_no}}\",\n  \"delta_quota\": 100,\n  \"reason\": \"nova-postman\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{nova_base_url}}/api/novapay/tenant/{{tenant_key}}/quota",
+            "description": "Adds or subtracts tenant quota with a unique order number."
+          }
+        },
+        {
+          "name": "Disable tenant",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Accept", "value": "application/json" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"request_id\": \"{{request_id}}\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{nova_base_url}}/api/novapay/tenant/{{tenant_key}}/disable",
+            "description": "Disables the tenant and all of its tokens."
+          }
+        },
+        {
+          "name": "Enable tenant",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Accept", "value": "application/json" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"request_id\": \"{{request_id}}\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{nova_base_url}}/api/novapay/tenant/{{tenant_key}}/enable",
+            "description": "Enables the tenant without re-enabling individually disabled tokens."
+          }
+        },
+        {
+          "name": "Rotate tenant key",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code >= 200 && pm.response.code < 300) {",
+                  "  const payload = pm.response.json();",
+                  "  if (payload.data && payload.data.token_key) pm.environment.set('api_token', payload.data.token_key);",
+                  "  if (payload.data && payload.data.token_name) pm.environment.set('token_name', payload.data.token_name);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Accept", "value": "application/json" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"reason\": \"suspected leak\",\n  \"request_id\": \"{{request_id}}\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{nova_base_url}}/api/novapay/tenant/{{tenant_key}}/token/rotate",
+            "description": "Rotates the primary token secret, saves the new token into the environment, and invalidates the old secret immediately."
+          }
+        },
+        {
+          "name": "Query tenant keys",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Accept", "value": "application/json" }],
+            "url": "{{nova_base_url}}/api/novapay/tenant/{{tenant_key}}/tokens",
+            "description": "Lists tenant API keys including the full secret."
+          }
+        },
+        {
+          "name": "Set token quota",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Accept", "value": "application/json" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"remain_quota\": 500000,\n  \"unlimited_quota\": false,\n  \"reason\": \"employee quota\",\n  \"request_id\": \"{{request_id}}\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{nova_base_url}}/api/novapay/tenant/{{tenant_key}}/tokens/{{token_name}}/quota",
+            "description": "Sets remain_quota and unlimited_quota for the token named in the URL."
+          }
+        },
+        {
+          "name": "Revoke token",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              { "key": "Accept", "value": "application/json" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"request_id\": \"{{request_id}}\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{nova_base_url}}/api/novapay/tenant/{{tenant_key}}/tokens/{{token_name}}",
+            "description": "Disables the token named in the request URL."
+          }
+        },
+        {
+          "name": "Usage ledger",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Accept", "value": "application/json" }],
+            "url": "{{nova_base_url}}/api/novapay/tenant/{{tenant_key}}/logs?size=100",
+            "description": "Reads successful Nova usage events for ledger and MQ reconciliation."
+          }
+        },
+        {
+          "name": "Soft-delete tenant",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              { "key": "Accept", "value": "application/json" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"request_id\": \"{{request_id}}\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{nova_base_url}}/api/novapay/tenant/{{tenant_key}}",
+            "description": "Soft-deletes the tenant while preserving its usage history."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Nova model API",
+      "description": "Model relay request using Bearer authentication plus Nova attribution. It inherits the same HMAC signing implementation as the management folder.",
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const textEncoder = new TextEncoder();",
+              "function bytesToHex(bytes) { return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join(''); }",
+              "function formEncode(value) { return encodeURIComponent(value).replace(/%20/g, '+').replace(/[!'()*]/g, (character) => '%' + character.charCodeAt(0).toString(16).toUpperCase()); }",
+              "function canonicalQuery() {",
+              "  const entries = pm.request.url.query.all().filter((parameter) => !parameter.disabled).map((parameter) => [pm.variables.replaceIn(parameter.key || ''), pm.variables.replaceIn(parameter.value || '')]);",
+              "  entries.sort((left, right) => { if (left[0] !== right[0]) return left[0] < right[0] ? -1 : 1; if (left[1] === right[1]) return 0; return left[1] < right[1] ? -1 : 1; });",
+              "  return entries.map(([key, value]) => formEncode(key) + '=' + formEncode(value)).join('&');",
+              "}",
+              "function requestPath() {",
+              "  const resolvedUrl = pm.variables.replaceIn(pm.request.url.toString());",
+              "  const match = resolvedUrl.match(/^[a-z][a-z0-9+.-]*:\\/\\/[^/]*(\\/[^?#]*)?/i);",
+              "  return match && match[1] ? match[1] : '/';",
+              "}",
+              "function decodeBase64Url(value) {",
+              "  let normalized = value.trim().replace(/-/g, '+').replace(/_/g, '/');",
+              "  normalized += '='.repeat((4 - normalized.length % 4) % 4);",
+              "  return Uint8Array.from(atob(normalized), (character) => character.charCodeAt(0));",
+              "}",
+              "const secret = decodeBase64Url(pm.environment.get('nova_hmac_secret') || '');",
+              "if (secret.byteLength < 32) throw new Error('nova_hmac_secret must be base64url and decode to at least 32 bytes');",
+              "const timestamp = Math.floor(Date.now() / 1000).toString();",
+              "const nonce = pm.variables.replaceIn('{{$guid}}');",
+              "const requestId = 'nova-postman-' + pm.variables.replaceIn('{{$guid}}');",
+              "pm.variables.set('nova_request_id', requestId);",
+              "const body = pm.request.body && pm.request.body.mode === 'raw' ? pm.variables.replaceIn(pm.request.body.raw || '') : '';",
+              "const bodyHash = bytesToHex(new Uint8Array(await crypto.subtle.digest('SHA-256', textEncoder.encode(body))));",
+              "const canonical = [pm.request.method.toUpperCase(), requestPath(), canonicalQuery(), timestamp, nonce, bodyHash].join('\\n');",
+              "const key = await crypto.subtle.importKey('raw', secret, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);",
+              "const signature = bytesToHex(new Uint8Array(await crypto.subtle.sign('HMAC', key, textEncoder.encode(canonical))));",
+              "const keyId = (pm.environment.get('nova_key_id') || '').trim();",
+              "if (keyId) pm.request.headers.upsert({ key: 'X-Nova-Key-Id', value: keyId }); else pm.request.headers.remove('X-Nova-Key-Id');",
+              "pm.request.headers.upsert({ key: 'X-Nova-Timestamp', value: timestamp });",
+              "pm.request.headers.upsert({ key: 'X-Nova-Nonce', value: nonce });",
+              "pm.request.headers.upsert({ key: 'X-Nova-Signature', value: signature });",
+              "console.log('Nova canonical request:\\n' + canonical);"
+            ]
+          }
+        }
+      ],
+      "item": [
+        {
+          "name": "Chat completion and usage message",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Accept", "value": "application/json" },
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{api_token}}", "type": "text" },
+              { "key": "X-Nova-Tenant-Key", "value": "{{tenant_key}}", "type": "text" },
+              { "key": "X-Nova-Request-Id", "value": "{{nova_request_id}}", "type": "text" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"{{model}}\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"Reply with ok only\"\n    }\n  ],\n  \"max_tokens\": 8,\n  \"stream\": false\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{nova_base_url}}/v1/chat/completions",
+            "description": "Calls the selected model and produces a Nova usage event after settlement."
+          }
+        }
+      ]
+    }
+  ]
+}

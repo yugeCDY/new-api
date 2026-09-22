@@ -81,6 +81,29 @@ Nova 平台                          New-API
 
 ---
 
+### 1.2 Postman 联调
+
+仓库提供可直接导入 Postman 的 Collection 和 Environment，适合在接入、排障时逐个调用 Nova HTTP 接口：
+
+- [Nova Integration Lab Collection](postman/Nova-Integration-Lab.postman_collection.json)：包含全部 15 个管理 API 和 1 个模型调用 API；在请求发送前自动生成 `X-Nova-Timestamp`、`X-Nova-Nonce`、请求标识，并使用 Web Crypto 计算 `X-Nova-Signature`。
+- [Nova Integration Lab Environment](postman/Nova-Integration-Lab.postman_environment.json)：仅预置 `nova_base_url` 为本机地址，其余变量均为空，避免导入环境携带凭据或业务租户信息。
+
+导入两个文件并选择该环境后，填写以下环境变量的**当前值**：
+
+| 变量 | 必填场景 | 说明 |
+|---|---|---|
+| `nova_base_url` | 全部请求 | New-API 服务根地址；默认 `http://127.0.0.1:3000` |
+| `nova_hmac_secret` | 全部请求 | 部署方交付的 base64url HMAC Secret，解码后至少 32 字节 |
+| `nova_key_id` | 可选 | HMAC Key Id；单密钥部署可留空 |
+| `tenant_key` | 租户及模型请求 | Nova 租户标识；创建租户前自行指定 |
+| `token_name` | 令牌额度 / 吊销 | 对应的令牌名称 |
+| `api_token` | 模型请求 | Nova 租户 Token；「创建租户」和「轮换主令牌」成功后会自动更新 |
+| `model` | 模型请求 | 要调用的模型名称 |
+
+Collection 不包含 RabbitMQ Management API 操作；RabbitMQ 消费端请按第 6 节使用 AMQP 客户端自行声明队列、绑定 Exchange 并消费消息。签名规则仍以第 2 节为准。
+
+---
+
 ## 2. HMAC 认证
 
 管理 API 的全部接口（含 `/health`）以及业务请求归属头共用同一套 HMAC-SHA256 签名算法。
