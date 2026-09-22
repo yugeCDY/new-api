@@ -2,6 +2,7 @@ package nova
 
 import (
 	"errors"
+	"strconv"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -92,18 +93,22 @@ func recordFinalizedUsage(event service.UsageLifecycleEvent) error {
 	ref := LogRef{EventID: uuid.NewString(), SourceType: event.SourceType, SourceKey: event.SourceKey,
 		TenantKey: username, UserID: event.UserID, TokenID: event.TokenID, RequestID: requestID,
 		NovaRequestID: novaRequestID, LogID: event.LogID, OccurredAt: event.OccurredAt, CreatedAt: now}
-	payload, err := marshalUsageMessage(ref)
-	if err != nil {
-		return err
-	}
-	outbox := Outbox{EventID: ref.EventID, ExchangeName: config.Exchange, RoutingKey: config.RoutingKey,
-		Payload: string(payload), Status: "pending", NextAttemptAt: now, CreatedAt: now, UpdatedAt: now}
 	return db.Transaction(func(tx *gorm.DB) error {
 		created := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&ref)
 		if created.Error != nil {
 			return created.Error
 		}
 		if created.RowsAffected != 0 {
+			ref.EventID = strconv.FormatInt(ref.ID, 10)
+			if err := tx.Model(&ref).Update("event_id", ref.EventID).Error; err != nil {
+				return err
+			}
+			payload, err := marshalUsageMessage(ref)
+			if err != nil {
+				return err
+			}
+			outbox := Outbox{EventID: ref.EventID, ExchangeName: config.Exchange, RoutingKey: config.RoutingKey,
+				Payload: string(payload), Status: "pending", NextAttemptAt: now, CreatedAt: now, UpdatedAt: now}
 			if err := tx.Create(&outbox).Error; err != nil {
 				return err
 			}

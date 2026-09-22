@@ -8,7 +8,7 @@
 | 消息 Exchange | `nova.events`（topic，durable） |
 | 用量消息 Routing Key | `nova.usage.reported` |
 | 消息 Content-Type / Mode | `application/json` / persistent |
-| 幂等去重键 | AMQP `Message-Id`（= 消息 `event_id`） |
+| 幂等去重键 | AMQP `Message-Id`（= 账本 `id` 的十进制字符串） |
 | 交付语义 | **at-least-once**（重复投递由消费端按去重键去重） |
 
 ---
@@ -704,12 +704,13 @@ X-Nova-Signature: <HMAC-SHA256 hex>
 | Routing Key | `nova.usage.reported` |
 | Delivery Mode | persistent |
 | Content-Type | `application/json` |
-| Message-Id | 等于 `event_id`（**幂等去重键**） |
+| Message-Id | 等于账本 `id` 的十进制字符串（**幂等去重键**；仅作为 AMQP 属性传输） |
 | 消费队列 | 由消费方自行声明并绑定上述 exchange + routing key；服务端**不代建队列** |
 
 ### 6.2 消息结构
 
 消息 payload 与 `GET /api/novapay/tenant/{key}/logs` 的 `data.items[]` 单项**结构完全一致**（不含 `has_more`）。
+消费者必须从 AMQP `Message-Id` 读取幂等去重键；其值与 payload 的数值字段 `id` 表示同一账本行。
 
 **顶层字段：**
 
@@ -840,7 +841,7 @@ X-Nova-Signature: <HMAC-SHA256 hex>
 
 ### 6.6 消费要求（强制）
 
-1. 以 AMQP `Message-Id`（即 `event_id`）做**幂等去重**（数据库唯一约束或等价机制）；重复投递应 ACK 且不重复记账。
+1. 以 AMQP `Message-Id`（即 payload `id` 的十进制字符串）做**幂等去重**（数据库唯一约束或等价机制）；重复投递应 ACK 且不重复记账。
 2. 可用 `(request_id, nova_request_id, tenant_key)` 作业务侧辅助核对，**权威去重键仍是 `Message-Id`**。
 3. 处理成功后再 ACK；失败 NACK / 重回队列，避免静默丢账。
 4. 因交付为 **at-least-once**，同一消息可能在服务端重连 / 重试后重复投递，消费端必须容忍重复。
@@ -855,5 +856,5 @@ X-Nova-Signature: <HMAC-SHA256 hex>
 | Token / 令牌 | 调用模型所用的 `sk-` API 密钥；属于某一租户 |
 | 额度（quota） | 计费用量单位；租户级余额存于用户，令牌级额度存于各令牌 |
 | 账本 / 用量账本 | New-API 侧按成功结算记录写入的用量明细（`/logs` 与 MQ 消息同源） |
-| `event_id` | 用量事件唯一 id，作为 AMQP `Message-Id` 传输 |
+| `event_id` | 内部用量事件标识，等于账本 `id` 的十进制字符串，并作为 AMQP `Message-Id` 传输 |
 | 归属 | 把一次业务请求计入特定租户的过程 |

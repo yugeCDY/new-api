@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -942,10 +943,15 @@ func TestFinalizedUsageCreatesOneLedgerAndOutboxRecord(t *testing.T) {
 	assert.Equal(t, event.SourceKey, stored.SourceKey)
 	assert.Equal(t, consumeLog.Id, stored.LogID)
 	assert.Equal(t, "nova-request-1", stored.NovaRequestID)
+	assert.Equal(t, strconv.FormatInt(stored.ID, 10), stored.EventID)
 
 	var outbox Outbox
 	require.NoError(t, db.First(&outbox).Error)
 	assert.Equal(t, "pending", outbox.Status)
+	assert.Equal(t, stored.EventID, outbox.EventID)
+	var initialMessage usageLogResponse
+	require.NoError(t, common.UnmarshalJsonStr(outbox.Payload, &initialMessage))
+	assert.Equal(t, stored.ID, initialMessage.ID)
 	assert.Contains(t, outbox.Payload, `"tenant_key":"nova-ledger-user"`)
 	assert.Contains(t, outbox.Payload, `"quota_data"`)
 	assert.Contains(t, outbox.Payload, `"model_name":"test-model"`)
