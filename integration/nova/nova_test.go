@@ -434,7 +434,7 @@ func TestListTenantsKeepsOrphanWhenUserIsGone(t *testing.T) {
 	assert.Equal(t, "ok", byKey["nova-list-user"]["display_name"])
 	assert.EqualValues(t, 42, byKey["nova-list-user"]["quota"])
 	assert.EqualValues(t, 7, byKey["nova-list-user"]["used_quota"])
-	assert.EqualValues(t, now, byKey["nova-list-user"]["last_active_at"])
+	assert.Equal(t, time.Unix(now, 0).UTC().Format(time.RFC3339), byKey["nova-list-user"]["last_active_at"])
 	assert.Equal(t, "orphan", byKey["list-orphan"]["display_name"])
 	assert.Equal(t, tenantStatusDeleted, byKey["list-orphan"]["status"])
 

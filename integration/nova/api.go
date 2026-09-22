@@ -101,8 +101,8 @@ type tenantListItem struct {
 	Status       string `json:"status"`
 	Quota        int    `json:"quota"`
 	UsedQuota    int    `json:"used_quota"`
-	CreatedAt    int64  `json:"created_at"`
-	LastActiveAt int64  `json:"last_active_at"`
+	CreatedAt    string `json:"created_at"`
+	LastActiveAt string `json:"last_active_at"`
 }
 
 type tenantKeyItem struct {
@@ -307,8 +307,8 @@ func listTenants(c *gin.Context) {
 			Status:       tenantStatusFromUser(user),
 			Quota:        row.Quota,
 			UsedQuota:    row.UsedQuota,
-			CreatedAt:    row.CreatedAt,
-			LastActiveAt: lastActive,
+			CreatedAt:    formatUnixUTC(row.CreatedAt),
+			LastActiveAt: formatUnixUTC(lastActive),
 		})
 	}
 	c.JSON(http.StatusOK, successBody(gin.H{
