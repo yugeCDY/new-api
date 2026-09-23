@@ -259,6 +259,7 @@ func TestDoubaoSeedanceUsageFacts(t *testing.T) {
 		fast20 = "doubao-seedance-2-0-fast-260128"
 		mini20 = "doubao-seedance-2-0-mini-260615"
 		v25    = "doubao-seedance-2-5-260628"
+		weVideo = "we-video-v2.5"
 	)
 	families := []struct {
 		models      []string
@@ -269,7 +270,7 @@ func TestDoubaoSeedanceUsageFacts(t *testing.T) {
 		{[]string{pro15}, []string{"480p", "720p", "1080p"}, []string{"generate_audio", "resolution", "tokens"}},
 		{[]string{v20}, []string{"480p", "720p", "1080p", "4k"}, []string{"resolution", "tokens", "video_input"}},
 		{[]string{fast20, mini20}, []string{"480p", "720p"}, []string{"resolution", "tokens", "video_input"}},
-		{[]string{v25}, []string{"480p", "720p", "1080p"}, []string{"resolution", "tokens", "video_input"}},
+		{[]string{v25, weVideo}, []string{"480p", "720p", "1080p"}, []string{"resolution", "tokens", "video_input"}},
 	}
 	profiled := make([]string, 0, len(plugin.Meta.Models))
 	for _, family := range families {
